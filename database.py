@@ -1,11 +1,14 @@
 """
+A module for database processing
+
 Package Requirement :
     mysql-conector-python
     pandas
 """
+import gc
 import os
 import pandas as pd
-import mysql.connector
+# import mysql.connector
 
 
 class DataBase:
@@ -18,7 +21,7 @@ class DataBase:
         :param local_db: str, file name of local database (with extension), assumed csv
         """
         self.LOCAL_DB = local_db
-        self.DATA_FRAME = self.read()
+        self.DATA_FRAME = None  # self.read()
 
 
     def download(self):
@@ -85,13 +88,13 @@ class DataBase:
             # data_frame = pd.read_csv(self.LOCAL_DB)
 
 
-    def read(self):
+    def read(self, **kwargs):
         """
         Read local data to pandas dataframe
 
         :return: pandas.DataFrame
         """
-        data_frame = pd.read_csv(self.LOCAL_DB)
+        data_frame = pd.read_csv(self.LOCAL_DB, **kwargs)
 
         return data_frame
 
@@ -102,6 +105,10 @@ class DataBase:
 
         :return:
         """
+        # load data frame if not exists
+        if not hasattr(self, "DATA_FRAME"):
+            self.DATA_FRAME = self.read()
+            
         return self.DATA_FRAME.info
 
 
@@ -109,21 +116,23 @@ class DataBase:
         """
         Get headers' name of database
 
-        :return:
+        :return: list of str
         """
-        # data_frame.columns
-
-        return self.DATA_FRAME.head()
-
-
-    def get_column(self, column_name, filters = dict):
+        return self.read(nrows = 0).columns.tolist()
+    
+    
+    def get_column(self, column_name, filters = None):
         """
         Get columns' data from database
 
         :param column_name: list of str, name/header of column to select
-        :param filters: dict {column: filter} for filtering selected column
-        :return: new copy of pandas.DataFrame
+        :param filters: list of dict [{column: [comparison operator, filter]}, ...] for filtering selected column
+        :return: new copy of pandas.DataFrame if filters is applied
         """
+        # load data frame if not exists
+        if not hasattr(self, "DATA_FRAME"):
+            self.DATA_FRAME = self.read()
+            
         # check if column exists
         for col in column_name:
 
@@ -136,12 +145,95 @@ class DataBase:
         # apply filter
         if filters:
             result = self.DATA_FRAME.copy()
-
-            for col, filter in filters.items():
-                result = result[ result[col] == filter ]
+            
+            for _filter in filters:
+                
+                for col, condition in _filter.items():
+                    
+                    if condition[0] not in ["=", "==", ">=", "<=", ">", "<", "!="]:
+                        raise SyntaxError(f"Invalid Comparison Operator {_filter[0]}")
+                    
+                    if condition[0] in ["=", "=="]:
+                        result = result[ result[col] == condition[1] ]
+                        
+                    elif condition[0] == ">=":
+                        result = result[ result[col] >= condition[1] ]
+                        
+                    elif condition[0] == "<=":
+                        result = result[ result[col] <= condition[1] ]
+                        
+                    elif condition[0] == ">":
+                        result = result[ result[col] > condition[1] ]
+                        
+                    elif condition[0] == "<":
+                        result = result[ result[col] < condition[1] ]
+                        
+                    elif condition[0] == "!=":
+                        result = result[ result[col] != condition[1] ]
 
             return result[column_name]
 
         return self.DATA_FRAME[column_name]
-
     
+    
+    def close(self):
+        """
+        Clear computer memory
+        
+        :return:
+        """
+        del self.DATA_FRAME
+        gc.collect()
+    
+    
+    def export(self, output_file_name = "output.csv", column_name = None, filters = None, encoding = "utf-8"):
+        """
+        Export selected column(s)
+        
+        :param output_file_name: str, file name of outputted CSV file (with extension)
+        :param column_name: list of str, name/header of column to select
+        :param filters: list of dict [{column: [comparison operator, filter]}, ...] for filtering selected column
+        :param encoding: encoding of the outputted CSV file
+        :return:
+        """
+        
+        if (not column_name) and (not filters):
+            # both column and filters are not specified
+            print("[WARNING] Specify at least one parameter from \"column\" and \"filters\" to export as new dataset.")
+            return False
+        
+        if column_name:
+            # column is specified
+            # filters is optional
+            result = self.get_column(column_name, filters)
+            result.to_csv(
+                    output_file_name,
+                    index = False,  # prevent writing row index number
+                    encoding = encoding
+            )
+            
+        else:
+            # only filters is provided
+            column = self.get_header()
+            result = self.get_column(column, filters)
+            result.to_csv(
+                    output_file_name,
+                    index = False,  # prevent writing row index number
+                    encoding = encoding
+            )
+        
+        print(f"[INFO] Exported {output_file_name}")
+        
+        return True
+        
+    
+    def append(self, data_frame1, data_frame2, *args):
+        column = data_frame1.columns.tolist()
+        result = pd.merge(data_frame1, data_frame2, on = column, how = "outer")
+        
+        if args:
+            for df in args:
+                result = pd.merge(result, df, on = column, how = "outer")
+        
+        return result
+

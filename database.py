@@ -2,7 +2,7 @@
 A module for database processing
 
 Package Requirement :
-    mysql-conector-python
+    (mysql-conector-python)
     pandas
 """
 import gc
@@ -21,7 +21,7 @@ class DataBase:
         :param local_db: str, file name of local database (with extension), assumed csv
         """
         self.LOCAL_DB = local_db
-        self.DATA_FRAME = None  # self.read()
+        # self.DATA_FRAME = None  # self.read()
 
 
     def download(self):
@@ -92,7 +92,7 @@ class DataBase:
         """
         Read local data to pandas dataframe
 
-        :return: pandas.DataFrame
+        :return: new copy of pandas.DataFrame
         """
         data_frame = pd.read_csv(self.LOCAL_DB, **kwargs)
 
@@ -118,6 +118,7 @@ class DataBase:
 
         :return: list of str
         """
+        # list(self.DATA_FRAME.columns)
         return self.read(nrows = 0).columns.tolist()
     
     
@@ -127,24 +128,25 @@ class DataBase:
 
         :param column_name: list of str, name/header of column to select
         :param filters: list of dict [{column: [comparison operator, filter]}, ...] for filtering selected column
-        :return: new copy of pandas.DataFrame if filters is applied
+        :return: new copy of pandas.DataFrame
         """
         # load data frame if not exists
-        if not hasattr(self, "DATA_FRAME"):
-            self.DATA_FRAME = self.read()
-            
+        # if not hasattr(self, "DATA_FRAME"):
+        #     self.DATA_FRAME = self.read()
+        
         # check if column exists
         for col in column_name:
 
-            if col not in self.DATA_FRAME.columns:
+            if col not in self.get_header():  # self.DATA_FRAME.columns:
                 print(f"[ERROR] Column {col} not found")
-                print(f"Available columns : {list(self.DATA_FRAME.columns)}")
+                print(f"Available columns : {self.get_header()}")
 
                 return None
-
+            
         # apply filter
         if filters:
-            result = self.DATA_FRAME.copy()
+            filter_column = list(set(key for filter_dict in filters for key in filter_dict.keys()))
+            result = self.read(usecols = column_name + filter_column)  # self.DATA_FRAME.copy()
             
             for _filter in filters:
                 
@@ -172,8 +174,8 @@ class DataBase:
                         result = result[ result[col] != condition[1] ]
 
             return result[column_name]
-
-        return self.DATA_FRAME[column_name]
+        
+        return self.read(usecols = column_name)  # self.DATA_FRAME[column_name]
     
     
     def close(self):
@@ -182,7 +184,10 @@ class DataBase:
         
         :return:
         """
-        del self.DATA_FRAME
+        
+        if hasattr(self, "DATA_FRAME"):
+            del self.DATA_FRAME
+            
         gc.collect()
     
     

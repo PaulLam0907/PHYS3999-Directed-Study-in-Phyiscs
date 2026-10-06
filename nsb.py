@@ -367,3 +367,104 @@ print(NSB.get_moon_phase("2026-01-19 03:52:00"))
 # print(NSB.one_month_average("2018-01-02"))
 # print(NSB.one_year_average("2018-02-02"))  # error
 """
+'''
+import math
+
+def julian_date(year, month, day):
+    """Convert a calendar date to Julian Date."""
+    if month <= 2:
+        year -= 1
+        month += 12
+    A = math.floor(year / 100)
+    B = 2 - A + math.floor(A / 4)
+    JD = math.floor(365.25 * (year + 4716)) \
+         + math.floor(30.6001 * (month + 1)) \
+         + day + B - 1524.5
+    return JD
+
+def moon_phase_duffett(year, month, day):
+    """
+    Calculate moon phase using Duffett-Smith's 1981 algorithm.
+    Returns:
+        phase_name (str), illumination_percent (float), phase_fraction (float)
+    """
+    # Julian date for given date
+    jd = julian_date(year, month, day)
+
+    # Days since epoch (1900 Jan 0.5)
+    days_since_epoch = jd - 2415020.0
+
+    # Mean anomaly of the Sun
+    N = (360 / 365.2422) * days_since_epoch
+    N = N % 360
+
+    # Mean anomaly of the Moon
+    M_sun = N
+    M_moon = (360 / 27.321582) * days_since_epoch
+    M_moon = M_moon % 360
+
+    # Sun's mean longitude
+    L_sun = M_sun + 279.696678
+    L_sun = L_sun % 360
+
+    # Moon's mean longitude
+    L_moon = M_moon + 270.434164
+    L_moon = L_moon % 360
+
+    # Moon's mean anomaly
+    M_moon_anomaly = L_moon - 0.111404 * days_since_epoch - 318.15
+    M_moon_anomaly = M_moon_anomaly % 360
+
+    # Moon's argument of latitude
+    F = L_moon - L_sun
+    F = F % 360
+
+    # Perturbations
+    # Convert to radians for trig functions
+    M_sun_rad = math.radians(M_sun)
+    M_moon_anomaly_rad = math.radians(M_moon_anomaly)
+    F_rad = math.radians(F)
+
+    # Correction terms from Duffett-Smith
+    corr = -0.1734 * math.sin(M_moon_anomaly_rad) \
+           - 0.0021 * math.sin(2 * M_moon_anomaly_rad) \
+           + 0.0161 * math.sin(M_sun_rad) \
+           + 0.0004 * math.sin(2 * M_sun_rad) \
+           - 0.0005 * math.sin(F_rad)
+
+    # Phase angle (degrees)
+    phase_angle = F + corr
+    phase_angle = phase_angle % 360
+
+    # Fraction of cycle (0 = New Moon, 0.5 = Full Moon)
+    phase_fraction = (1 - math.cos(math.radians(phase_angle))) / 2
+
+    # Illumination percentage
+    illumination_percent = phase_fraction * 100
+
+    # Phase name mapping
+    phase_names = [
+        "New Moon",
+        "Waxing Crescent",
+        "First Quarter",
+        "Waxing Gibbous",
+        "Full Moon",
+        "Waning Gibbous",
+        "Last Quarter",
+        "Waning Crescent"
+    ]
+    phase_index = int(phase_fraction * 8 + 0.5) % 8
+
+    return phase_names[phase_index], illumination_percent, phase_fraction
+
+# Epoch Reference:
+# Uses 1900 Jan 0.5 as the base Julian date (2415020.0).
+# Mean Anomalies:
+# Calculates Sun and Moon mean anomalies separately.
+# Perturbations:
+# Applies small corrections for orbital eccentricity and latitude.
+# Phase Angle:
+# Determines the angular separation between Sun and Moon.
+# Illumination:
+# Uses cosine of phase angle to get illuminated fraction.
+'''

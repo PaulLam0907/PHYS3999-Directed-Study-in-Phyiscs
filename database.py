@@ -24,7 +24,7 @@ class DataBase:
         # self.DATA_FRAME = None  # self.read()
 
 
-    def download(self):
+    def _download(self):
         """
         Download database from MySQL
 
@@ -95,7 +95,7 @@ class DataBase:
         :return: new copy of pandas.DataFrame
         """
         data_frame = pd.read_csv(self.LOCAL_DB, **kwargs)
-
+        
         return data_frame
 
 
@@ -147,33 +147,41 @@ class DataBase:
         if filters:
             filter_column = list(set(key for filter_dict in filters for key in filter_dict.keys()))
             result = self.read(usecols = column_name + filter_column)  # self.DATA_FRAME.copy()
+            _filter = pd.Series(True, index = result.index)
             
-            for _filter in filters:
+            for i in filters:
                 
-                for col, condition in _filter.items():
+                for col, condition in i.items():
                     
                     if condition[0] not in ["=", "==", ">=", "<=", ">", "<", "!="]:
-                        raise SyntaxError(f"Invalid Comparison Operator {_filter[0]}")
+                        raise SyntaxError(f"Invalid Comparison Operator {condition[0]}")
                     
                     if condition[0] in ["=", "=="]:
-                        result = result[ result[col] == condition[1] ]
+                        # result = result[ result[col] == condition[1] ]
+                        _filter &= (result[col] == condition[1])
                         
                     elif condition[0] == ">=":
-                        result = result[ result[col] >= condition[1] ]
+                        # result = result[ result[col] >= condition[1] ]
+                        _filter &= (result[col] >= condition[1])
                         
                     elif condition[0] == "<=":
-                        result = result[ result[col] <= condition[1] ]
+                        # result = result[ result[col] <= condition[1] ]
+                        _filter &= (result[col] <= condition[1])
                         
                     elif condition[0] == ">":
-                        result = result[ result[col] > condition[1] ]
+                        # result = result[ result[col] > condition[1] ]
+                        _filter &= (result[col] > condition[1])
                         
                     elif condition[0] == "<":
-                        result = result[ result[col] < condition[1] ]
+                        # result = result[ result[col] < condition[1] ]
+                        _filter &= (result[col] < condition[1])
                         
                     elif condition[0] == "!=":
-                        result = result[ result[col] != condition[1] ]
-
-            return result[column_name]
+                        # result = result[ result[col] != condition[1] ]
+                        _filter &= (result[col] != condition[1])
+            
+            # return result[column_name]
+            return result.loc[_filter, column_name]
         
         return self.read(usecols = column_name)  # self.DATA_FRAME[column_name]
     

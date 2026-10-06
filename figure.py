@@ -49,6 +49,32 @@ class Figure:
         axes = self.AXES[axes_index]
         axes.plot(x_data, y_data, **kwargs)
         
+    
+    def plot_horizontal_line(self, y_value, axes_index = 0, **kwargs):
+        """
+        Plot horizontal line across entire axes
+        
+        :param y_value: float, value for vertical axis where line sits
+        :param axes_index: int, count from 0, from top left -> top right -> ... -> to bottom right
+        :param kwargs: any keyword argument passed to axes.plot()
+        :return: None
+        """
+        axes = self.AXES[axes_index]
+        axes.axhline(y = y_value, **kwargs)
+    
+    
+    def plot_vertical_line(self, x_value, axes_index = 0, **kwargs):
+        """
+        Plot vertical line across entire axes
+        
+        :param x_value: float, value for horizontal axis where line sits
+        :param axes_index: int, count from 0, from top left -> top right -> ... -> to bottom right
+        :param kwargs: any keyword argument passed to axes.plot()
+        :return: None
+        """
+        axes = self.AXES[axes_index]
+        axes.axvline(x = x_value, **kwargs)
+        
         
     def set_axes_properties(self,
                             axes_index = 0,

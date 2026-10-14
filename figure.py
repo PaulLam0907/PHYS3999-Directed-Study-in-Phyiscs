@@ -85,6 +85,7 @@ class Figure:
                             xgrid = False, ygrid = False,
                             xticks = None, yticks = None,
                             xticklabels = None, yticklabels = None,
+                            invert_xaxis = False, invert_yaxis = False,
                             legend = False):
         """
         Customization for individual axes
@@ -102,6 +103,8 @@ class Figure:
         :param yticks: list
         :param xticklabels: list
         :param yticklabels: list
+        :param invert_xaxis: bool
+        :param invert_yaxis: bool
         :param legend: bool
         :return:
         """
@@ -135,6 +138,12 @@ class Figure:
         if yticklabels:
             axes.set_yticklabels(yticklabels)
         
+        if invert_xaxis:
+            axes.invert_xaxis()
+            
+        if invert_yaxis:
+            axes.invert_yaxis()
+            
         if legend:
             axes.legend()
         

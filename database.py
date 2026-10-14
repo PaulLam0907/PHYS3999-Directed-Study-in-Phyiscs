@@ -138,10 +138,8 @@ class DataBase:
         for col in column_name:
 
             if col not in self.get_header():  # self.DATA_FRAME.columns:
-                print(f"[ERROR] Column {col} not found")
-                print(f"Available columns : {self.get_header()}")
-
-                return None
+                raise ValueError(f"[ERROR] Column {col} not found\n"
+                                 f"Available columns : {self.get_header()}")
             
         # apply filter
         if filters:
@@ -181,7 +179,12 @@ class DataBase:
                         _filter &= (result[col] != condition[1])
             
             # return result[column_name]
-            return result.loc[_filter, column_name]
+            result = result.loc[_filter, column_name]
+            
+            if result.empty:
+                print(f"[WARNING] Empty dataframe in getting columns {column_name} with filters {filters}")
+                
+            return result
         
         return self.read(usecols = column_name)  # self.DATA_FRAME[column_name]
     
@@ -199,23 +202,31 @@ class DataBase:
         gc.collect()
     
     
-    def export(self, output_file_name = "output.csv", column_name = None, filters = None, encoding = "utf-8"):
+    def export(self, output_file_name = "output.csv", dataframe = None, column_name = None, filters = None, encoding = "utf-8"):
         """
-        Export selected column(s)
+        Export pandas.DataFrame or selected column(s) in self.LOCAL_DB
         
         :param output_file_name: str, file name of outputted CSV file (with extension)
+        :param dataframe: pandas.DataFrame, the exact dataframe to export
         :param column_name: list of str, name/header of column to select
         :param filters: list of dict [{column: [comparison operator, filter]}, ...] for filtering selected column
         :param encoding: encoding of the outputted CSV file
         :return:
         """
+        # validate parameters' value
+        # if (not column_name) and (not filters):
+        #     both dataframe, column, filters are not specified
+        #     raise ValueError("[ERROR] Specify at least one parameter from \"dataframe\", \"column\" and \"filters\" to export as new dataset.")
         
-        if (not column_name) and (not filters):
-            # both column and filters are not specified
-            print("[WARNING] Specify at least one parameter from \"column\" and \"filters\" to export as new dataset.")
-            return False
+        # export to CSV
+        if isinstance(dataframe, pd.DataFrame):
+            dataframe.to_csv(
+                    output_file_name,
+                    index = False,  # prevent writing row index number
+                    encoding = encoding
+            )
         
-        if column_name:
+        elif column_name:
             # column is specified
             # filters is optional
             result = self.get_column(column_name, filters)
@@ -224,8 +235,8 @@ class DataBase:
                     index = False,  # prevent writing row index number
                     encoding = encoding
             )
-            
-        else:
+        
+        elif filters:
             # only filters is provided
             column = self.get_header()
             result = self.get_column(column, filters)
@@ -234,12 +245,16 @@ class DataBase:
                     index = False,  # prevent writing row index number
                     encoding = encoding
             )
+            
+        else:
+            raise ValueError("[ERROR] Specify at least one parameter from \"dataframe\", \"column\" and \"filters\" to export as new dataset.")
         
         print(f"[INFO] Exported {output_file_name}")
         
         return True
         
     
+    ########## v---- should be in separate class for better logic ##########
     def append(self, data_frame1, data_frame2, *args):
         column = data_frame1.columns.tolist()
         result = pd.merge(data_frame1, data_frame2, on = column, how = "outer")
@@ -249,4 +264,55 @@ class DataBase:
                 result = pd.merge(result, df, on = column, how = "outer")
         
         return result
+    
+    
+    def concat(self, dataframe_list, ignore_index = True):
+        return pd.concat(dataframe_list, ignore_index = ignore_index)
+    
+    
+    def merge_csv(self, csv_file_name_list, output_file_name = "output.csv"):
+        db_list = []
+        
+        for i in csv_file_name_list:
+            self.LOCAL_DB = i
+            db_list.append(self.read())
+            
+        result = pd.concat(db_list, ignore_index = True)
+        result.to_csv(output_file_name, index = False)
+        
+        return True
 
+
+"""
+# merge csv
+DataBase().merge_csv(
+        [
+            "src/Sun/Sun_rise_set_2018.csv",
+            "src/Sun/Sun_rise_set_2019.csv",
+            "src/Sun/Sun_rise_set_2020.csv",
+            "src/Sun/Sun_rise_set_2020.csv",
+            "src/Sun/Sun_rise_set_2021.csv",
+            "src/Sun/Sun_rise_set_2022.csv",
+            "src/Sun/Sun_rise_set_2023.csv",
+            "src/Sun/Sun_rise_set_2024.csv",
+            "src/Sun/Sun_rise_set_2025.csv",
+            "src/Sun/Sun_rise_set_2026.csv",
+        ],
+        "src/Sun/Sun_rise_set_2018-2026.csv"
+)
+DataBase().merge_csv(
+        [
+            "src/Moon/Moon_rise_set_2018.csv",
+            "src/Moon/Moon_rise_set_2019.csv",
+            "src/Moon/Moon_rise_set_2020.csv",
+            "src/Moon/Moon_rise_set_2020.csv",
+            "src/Moon/Moon_rise_set_2021.csv",
+            "src/Moon/Moon_rise_set_2022.csv",
+            "src/Moon/Moon_rise_set_2023.csv",
+            "src/Moon/Moon_rise_set_2024.csv",
+            "src/Moon/Moon_rise_set_2025.csv",
+            "src/Moon/Moon_rise_set_2026.csv",
+        ],
+        "src/Moon/Moon_rise_set_2018-2026.csv"
+)
+"""

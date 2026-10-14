@@ -5,6 +5,8 @@ from figure import Figure
 from nsb import NightSkyBrightness
 
 
+
+"""
 def plot_one_month_nsb(fig, month_average, daily_average, moon_phase, title, axes_index = 0):
     fig.plot([i for i in range(1, len(daily_average) + 1)], daily_average, axes_index, label = "NSB")
     fig.plot_horizontal_line(month_average, axes_index, label = "Month average NSB")
@@ -38,17 +40,17 @@ NSB_HKU_2025 = NightSkyBrightness(
         "src/Moon/Moon_rise_set_2025.csv"
 )
 
-# january_data = NSB_HKU_2025.one_month_average("2025-01-01")
-# june_data = NSB_HKU_2025.one_month_average("2025-06-01")
+january_data = NSB_HKU_2025.one_month_average("2025-01-01")
+june_data = NSB_HKU_2025.one_month_average("2025-06-01")
 
-# fig = Figure("2025 NSB", 1, 2)
+fig = Figure("2025 NSB", 1, 2)
 
 # JANUARY
-# plot_one_month_nsb(fig, january_data[0], january_data[1], january_data[2], "January", 0)
+plot_one_month_nsb(fig, january_data[0], january_data[1], january_data[2], "January", 0)
 # JUNE
-# plot_one_month_nsb(fig, june_data[0], june_data[1], june_data[2], "June", 1)
+plot_one_month_nsb(fig, june_data[0], june_data[1], june_data[2], "June", 1)
 
-# fig.show()
+fig.show()
 
 
 # Plot 2015 to 2025 January average
@@ -65,7 +67,7 @@ for index in range(len(year)):
     plot_one_month_nsb(fig, data[0], data[1], data[2], year[index], index)
     
 fig.show()
-
+"""
 
 
 """

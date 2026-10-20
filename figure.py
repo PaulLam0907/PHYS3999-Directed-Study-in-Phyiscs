@@ -50,30 +50,53 @@ class Figure:
         axes.plot(x_data, y_data, **kwargs)
         
     
-    def plot_horizontal_line(self, y_value, axes_index = 0, **kwargs):
+    def plot_horizontal_line(self, y_value, label_in_graph = None, axes_index = 0, **kwargs):
         """
         Plot horizontal line across entire axes
         
         :param y_value: float, value for vertical axis where line sits
         :param axes_index: int, count from 0, from top left -> top right -> ... -> to bottom right
-        :param kwargs: any keyword argument passed to axes.plot()
+        :param label_in_graph: str, text label next to horizontal line in graph
+        :param kwargs: any keyword argument passed to axes.axhline()
         :return: None
         """
         axes = self.AXES[axes_index]
         axes.axhline(y = y_value, **kwargs)
+        
+        if label_in_graph:
+            axes.text(
+                    0.99,
+                    y_value,
+                    label_in_graph,
+                    ha = "right",  # horizontal align
+                    va = "bottom",  # vertical align
+                    transform = axes.get_yaxis_transform()
+            )
     
     
-    def plot_vertical_line(self, x_value, axes_index = 0, **kwargs):
+    def plot_vertical_line(self, x_value, label_in_graph = None, axes_index = 0, **kwargs):
         """
         Plot vertical line across entire axes
         
         :param x_value: float, value for horizontal axis where line sits
         :param axes_index: int, count from 0, from top left -> top right -> ... -> to bottom right
-        :param kwargs: any keyword argument passed to axes.plot()
+        :param label_in_graph: str, text label next to vertical line in graph
+        :param kwargs: any keyword argument passed to axes.axvline()
         :return: None
         """
         axes = self.AXES[axes_index]
         axes.axvline(x = x_value, **kwargs)
+        
+        if label_in_graph:
+            axes.text(
+                    x_value,
+                    0.99,
+                    label_in_graph,
+                    ha = "left",  # horizontal align
+                    va = "top",  # vertical align
+                    rotation = -90,
+                    transform = axes.get_xaxis_transform()
+            )
         
         
     def set_axes_properties(self,

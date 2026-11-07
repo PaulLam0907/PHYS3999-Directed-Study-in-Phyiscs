@@ -3,7 +3,7 @@ A module for night-sky brightness (NSB) analysis
 
 1. Slice data by time windows
 2. Algorithm :
-    - K-Medoids (PAM) (force data into a cluster, cannot find outlier, uniform cluster density, require guessing k)
+    - K-Medoids (PAM) (+FPCA) (force data into a cluster, cannot find outlier, uniform cluster density, require guessing k)
     - K-Mean (mean is sensitive to extreme value in the cluster)
     - DBSCAN (require guessing radius of cluster)
     - HDBSCAN (can find outlier, group by density not by curve shape if implement feature, can implement feature e.g. moon illuminated ratio, do not require guessing number of cluster or cluster radius)
@@ -20,9 +20,25 @@ A module for night-sky brightness (NSB) analysis
 Package Requirement :
     numpy
     pandas
+    scikit-learn
+    scikit-learn-extra
+    pypots
 """
+import os
+import joblib
+import h5py
 import datetime
 import numpy as np
+from scipy import signal
+from sklearn.cluster import AgglomerativeClustering, MiniBatchKMeans
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.metrics import silhouette_score, davies_bouldin_score
+from sklearn.model_selection import train_test_split
+from sklearn_extra.cluster import KMedoids
+from tslearn.clustering import TimeSeriesKMeans
+from tslearn.preprocessing import TimeSeriesScalerMeanVariance
+from pypots.clustering import CRLI
+from pypots.nn.functional import calc_chs, calc_dbs
 
 from database import DataBase
 
@@ -282,7 +298,8 @@ class NightSkyBrightness:
                 filters = [
                     {datetime_column_name: [">=", datetime_from]},
                     {datetime_column_name: ["<=", datetime_to]},
-                    # {"nsb": ["<", 23]}
+                    # {"nsb": ["<", 23]},
+                    # {"nsb": [">", 10]}
                 ]
         )
         print("[INFO] Data loaded to memory")
@@ -368,6 +385,942 @@ class NightSkyBrightness:
         return result, data
     
 
+class Clustering:
+    
+    def __init__(self):
+        self.DATASET = None
+        self.TRAIN_SET = None
+        self.VALIDATION_SET = None
+        self.TEST_SET = None
+        self.TRAIN_METADATA = None
+        self.VALIDATION_METADATA = None
+        self.TEST_METADATA = None
+        self.MODEL = None
+    
+    
+    def dataset(self, data_set, train_set_ratio, test_set_ratio, random_state = 42):
+        """
+        Use sklearn.model_selection.train_test_split() to split dataset
+        into [train, test, validation set]
+
+        :param data_set: the raw dataset to split
+        :param train_set_ratio: float [0, 1], ratio of the train set to whole dataset
+        :param test_set_ratio: float [0, 1], ratio of the test set to whole dataset
+        :param random_state: int
+        :return: tuple (train set, test set, validation set)
+        """
+        # split the dataset into different portion for different purpose
+        # test set = unseen data
+        _, test_set = train_test_split(data_set, test_size = test_set_ratio, random_state = random_state)
+        # (1 - test_set_ratio) for both validation_set and train_set
+        # test_set_ratio  = test_set / all  ( given )
+        # train_set_ratio = train_set / all  ( given )
+        # let x = ratio of train_set to [train_set + validation_set] = train_set / (train_set + validation_set)
+        # x * (train_set + validation_set) = train_set_ratio * all
+        # => x = train_set_ratio * all / (train_set + validation_set)
+        # => x = train_set_ratio / (1 - test_set_ratio)
+        validation_set, train_set = train_test_split(_, test_size = train_set_ratio / (1 - test_set_ratio),
+                                                     random_state = random_state)
+        
+        # store it into class properties
+        self.DATASET = data_set
+        self.TRAIN_SET = train_set
+        self.VALIDATION_SET = validation_set
+        self.TEST_SET = test_set
+        
+        # log
+        print(f"[INFO] Train set ({train_set.shape[0] / data_set.shape[0] * 100:.03}%) : {train_set.shape}")
+        print(f"[INFO] Test set ({test_set.shape[0] / data_set.shape[0] * 100:.03}%) : {test_set.shape}")
+        print(f"[INFO] Validation set ({validation_set.shape[0] / data_set.shape[0] * 100:.03}%) : {validation_set.shape}")
+        
+        return train_set, test_set, validation_set
+    
+    
+    def dataset_with_metadata(self, data_set, meta_data, train_set_ratio, test_set_ratio, random_state = 42):
+        """
+        Use sklearn.model_selection.train_test_split() to split dataset
+        into [train, test, validation set]
+        This method can be treated as the "extension" of dataset()
+
+        :param data_set: the raw dataset to split
+        :param meta_data: dict, metadata associated with each data points in dataset
+        :param train_set_ratio: float [0, 1], ratio of the train set to whole dataset
+        :param test_set_ratio: float [0, 1], ratio of the test set to whole dataset
+        :param random_state: int
+        :return: dict
+        {
+            "train": {
+                "data" : ...,
+                <key of metadata>: ...
+            },
+            "test": {
+                "data" : ...,
+                <key of metadata>: ...
+            },
+            "validation": {
+                "data" : ...,
+                <key of metadata>: ...
+            }
+        }
+        """
+        metadata_key = list(meta_data.keys())
+        result = {
+            "train": {},
+            "test": {},
+            "validation": {}
+        }
+        
+        # test set = unseen data
+        temp_metadata = []
+        _ = train_test_split(
+                data_set,
+                *[meta_data[key] for key in metadata_key],
+                test_size = test_set_ratio,
+                random_state = random_state
+        )
+        result["test"]["data"] = _[1]  # test set
+        
+        # store metadata
+        for i in range(1, len(metadata_key) + 1):
+            temp_metadata.append(_[2 * i])  # non-test metadata
+            result["test"][metadata_key[i - 1]] = _[2 * i + 1]  # test metadata
+            self.TEST_METADATA = _[2 * i + 1]  # test metadata
+        
+        # (1 - test_set_ratio) for both validation_set and train_set
+        __ = train_test_split(
+                _[0],  # non-test set data
+                *temp_metadata,  # non-test set metadata
+                test_size = train_set_ratio / (1 - test_set_ratio),
+                random_state = random_state
+        )
+        result["validation"]["data"] = __[0]  # validation set
+        result["train"]["data"] = __[1]  # train set
+        
+        # store metadata
+        for i in range(1, len(metadata_key)):
+            result["validation"][metadata_key[i - 1]] = __[2 * i]  # validation metadata
+            self.VALIDATION_METADATA = __[2 * i]  # validation metadata
+            result["train"][metadata_key[i - 1]] = __[2 * i + 1]  # train metadata
+            self.TRAIN_METADATA = __[2 * i + 1]  # train metadata
+        
+        # store data to class property
+        self.DATASET = data_set
+        self.TRAIN_SET = result["train"]["data"]
+        self.VALIDATION_SET = result["validation"]["data"]
+        self.TEST_SET = result["test"]["data"]
+        
+        # log
+        print(f"[INFO] Train set count : {len(self.TRAIN_SET)} ({len(self.TRAIN_SET) / len(data_set) * 100:.03}%)")
+        print(f"[INFO] Test set count : {len(self.TEST_SET)} ({len(self.TEST_SET) / len(data_set) * 100:.03}%)")
+        print(f"[INFO] Validation set count : {len(self.VALIDATION_SET)} ({len(self.VALIDATION_SET) / len(data_set) * 100:.03}%)")
+        
+        return result
+    
+    
+    def train_test_validation_set(self, train_set, test_set, validation_set):
+        """
+        Store custom train, test, validation dataset into class property
+
+        :param train_set: seen dataset for training
+        :param test_set: unseen dataset for testing
+        :param validation_set:
+        :return: None
+        """
+        self.TRAIN_SET = train_set
+        self.TEST_SET = test_set
+        self.VALIDATION_SET = validation_set
+    
+    
+    def load_model(self, file_name):
+        """
+        Load existing ML model and store to class property
+
+        :param file_name: str, file name of the saved model (with extension)
+        :return: the loaded model
+        """
+        model = joblib.load(file_name)
+        self.MODEL = model
+        
+        return model
+    
+
+class KMedoid(Clustering):
+    
+    def __init__(self):
+        """
+        A class for K-Medoids model clustering
+        
+        Before working on the model,
+        user should call either dataset() or train_test_validation_set() or dataset_with_metadata()
+        to provide data for model training and evaluation using class methods
+        """
+        # Clustering.__init__(self)
+        super().__init__()
+        
+    
+    def find_optimal_k(self, k_range, train_set = None, validation_set = None, metric = "euclidean", random_state = 42):
+        """
+        Find optimal number of cluster k
+        (hyperparameter tuning)
+        
+        :param k_range: tuple of int e.g. (3, 10), range of k to test
+        :param train_set: train dataset for model training. Default to self.TRAIN_SET
+        :param validation_set: validation set. Default to self.VALIDATION_SET
+        :param metric: str, distance metric for model e.g. euclidean, correlation, manhattan
+        :param random_state: int
+        :return: tuple (int: optimal k, float: silhouette score)
+        """
+        # default to class property if train_set and validation_set are not provided
+        if not train_set:
+            train_set = self.TRAIN_SET
+            
+        if not validation_set:
+            validation_set = self.VALIDATION_SET
+        
+        # find optimal number of cluster k
+        optimal_silhouette_k = 2
+        optimal_dbi_k = 2
+        silhouette_score_ = -1  # silhouette score find max, greatest separation between clusters
+        inertia = []  # Elbow Method
+        davies_bouldin_score_ = 1e3  # find min
+        
+        print("[INFO] Finding optimal value of k")
+        print(f"k  |  Silhouette Score  |  Davies Bouldin (DBI) Score  |  Inertia")
+        
+        for k in range(k_range[0], k_range[1] + 1):
+            np.random.seed(random_state)
+            _model = KMedoids(
+                    n_clusters = k,
+                    metric = metric,
+                    # method = "alternate",
+                    random_state = random_state
+            )
+            _model.fit(train_set)  # train model on train_set
+            _label = _model.predict(validation_set)  # predict data on validation_set
+            
+            # evaluate how well the validation data fit into trained clusters
+            _silhouette_score = silhouette_score(validation_set, _label, metric = metric)
+            _davies_bouldin_score = davies_bouldin_score(validation_set, _label)
+            print(f"{k} | {_silhouette_score} | {_davies_bouldin_score} | {_model.inertia_}")
+            
+            if _silhouette_score > silhouette_score_:
+                silhouette_score_ = _silhouette_score
+                optimal_silhouette_k = k
+            
+            if _davies_bouldin_score < davies_bouldin_score_:
+                davies_bouldin_score_ = _davies_bouldin_score
+                optimal_dbi_k = k
+                
+            # else:
+            #     print(f"Found optimal k = {optimal_k}")
+            #     break
+        
+        print(f"Optimal k for Silhouette Score : {optimal_silhouette_k}")
+        print(f"Optimal k for Davies Bouldin (DBI) Score : {optimal_dbi_k}")
+        
+        return optimal_silhouette_k, silhouette_score_  # todo
+    
+    
+    def fit(self, k, train_set = None, metric = "euclidean", random_state = 42, save_model = True):
+        """
+        Train K-Medoids model
+        
+        :param k: int, number of clusters
+        :param train_set: train dataset for model training. Default to self.TRAIN_SET
+        :param metric: str, distance metric for model
+        :param random_state: int
+        :param save_model: bool, indicate whether to save the trained model or not
+        :return: the trained K-Medoids model
+        """
+        # default to class property if train_set are not provided
+        if not train_set:
+            # train_set = self.TRAIN_SET
+            train_set = np.vstack((self.TRAIN_SET, self.VALIDATION_SET))
+            
+        # train the model
+        print(f"[INFO] Training K-Medoids model with k = {k} clusters")
+        model = KMedoids(
+                n_clusters = k,
+                metric = metric,
+                random_state = random_state
+        )
+        model.fit(train_set)
+        print("[INFO] Done")
+        
+        # save the model to class property
+        self.MODEL = model
+        print("[INFO] You may find the trained model in self.MODEL")
+        
+        # save the model to disk
+        if save_model:
+            joblib.dump(model, "K-Medoids_model.pkl")
+            print("[INFO] Model saved as ./K-Medoids_model.pkl")
+        
+        return model
+    
+    
+    def predict(self, model = None, test_set = None, metric = "euclidean"):
+        """
+        Model evaluation on unseen test set ( after fit() )
+        with fixed cluster center
+        
+        :param model: the K-Medoids model. Default to self.MODEL
+        :param test_set: test dataset for model evaluation. Default to self.TEST_SET
+        :param metric: str, distance metric for model
+        :return: tuple (cluster labels, silhouette score)
+        """
+        # default to class property if model and test_set are not provided
+        if not model:
+            model = self.MODEL
+            
+        if test_set is None:
+            test_set = self.TEST_SET
+        
+        test_labels = model.predict(test_set)
+        silhouette_score_ = silhouette_score(test_set, test_labels, metric = metric)
+        print(f"[INFO] Test Set Silhouette Score: {silhouette_score_:.4f}")
+        
+        return test_labels, silhouette_score_
+
+
+class Agglomerative(Clustering):
+    
+    def __init__(self):
+        """
+        A class for agglomerative clustering (bottom up)
+
+        Before working on the model,
+        user should call either dataset() or train_test_validation_set() or dataset_with_metadata()
+        to provide data for model training and evaluation using class methods
+        """
+        # Clustering.__init__(self)
+        super().__init__()
+    
+    
+    def find_optimal_n(self, n_range, train_set = None, validation_set = None, metric = "euclidean", linkage = "ward"):
+        """
+        Find optimal number of cluster n
+        (hyperparameter tuning)
+
+        :param n_range: tuple of int e.g. (3, 10), range of n to test
+        :param train_set: train dataset for model training. Default to self.TRAIN_SET
+        :param validation_set: validation set. Default to self.VALIDATION_SET
+        :param metric: str, distance metric for model e.g. euclidean, correlation, manhattan
+        :param linkage: str, linkage method
+        :return: tuple (int: optimal k, float: silhouette score)
+        """
+        # default to class property if train_set and validation_set are not provided
+        if not train_set:
+            train_set = self.TRAIN_SET
+        
+        if not validation_set:
+            validation_set = self.VALIDATION_SET
+        
+        # find optimal number of cluster k
+        optimal_silhouette_n = 2
+        optimal_dbi_n = 2
+        silhouette_score_ = -1  # silhouette score find max, greatest separation between clusters
+        davies_bouldin_score_ = 1e3  # find min
+        
+        print("[INFO] Finding optimal value of k")
+        print(f"n  |  Silhouette Score  |  Davies Bouldin (DBI) Score")
+        
+        for n in range(n_range[0], n_range[1] + 1):
+            _model = AgglomerativeClustering(
+                    n_clusters = n,
+                    metric = metric,
+                    linkage = linkage
+            )
+            _model.fit(train_set)  # train model on train_set
+            
+            _classifier = KNeighborsClassifier(n_neighbors = 1)  # todo KNN classifier
+            _classifier.fit(train_set, _model.labels_)
+            
+            _label = _classifier.predict(validation_set)  # predict data on validation_set
+            
+            # evaluate how well the validation data fit into trained clusters
+            _silhouette_score = silhouette_score(validation_set, _label, metric = metric)
+            _davies_bouldin_score = davies_bouldin_score(validation_set, _label)
+            print(f"{n} | {_silhouette_score} | {_davies_bouldin_score}")
+            
+            if _silhouette_score > silhouette_score_:
+                silhouette_score_ = _silhouette_score
+                optimal_silhouette_n = n
+            
+            if _davies_bouldin_score < davies_bouldin_score_:
+                davies_bouldin_score_ = _davies_bouldin_score
+                optimal_dbi_n = n
+            
+            # else:
+            #     print(f"Found optimal k = {optimal_k}")
+            #     break
+        
+        print(f"Optimal n for Silhouette Score : {optimal_silhouette_n}")
+        print(f"Optimal n for Davies Bouldin (DBI) Score : {optimal_dbi_n}")
+        
+        return optimal_silhouette_n, silhouette_score_  # todo
+    
+    
+    def fit(self, n_clusters, train_set = None, metric = "euclidean", linkage = "ward", save_model = True):
+        """
+        Train AgglomerativeClustering model
+
+        :param n_clusters: int, number of clusters
+        :param train_set: train dataset for model training. Default to self.TRAIN_SET
+        :param metric: str, distance metric for model
+        :param linkage: str, linkage method
+        :param save_model: bool, indicate whether to save the trained model or not
+        :return: the trained AgglomerativeClustering model
+        """
+        # default to class property if train_set are not provided
+        if not train_set:
+            # train_set = self.TRAIN_SET
+            train_set = np.vstack((self.TRAIN_SET, self.VALIDATION_SET))
+        
+        # train the model
+        print(f"[INFO] Training AgglomerativeClustering model with n_clusters = {n_clusters} clusters")
+        model = AgglomerativeClustering(
+                n_clusters = n_clusters,
+                metric = metric,
+                linkage = linkage
+        )
+        model.fit(train_set)
+        print("[INFO] Done")
+        
+        # save the model to class property
+        self.MODEL = model
+        print("[INFO] You may find the trained model in self.MODEL")
+        
+        # save the model to disk
+        if save_model:
+            joblib.dump(model, "AgglomerativeClustering_model.joblib")
+            print("[INFO] Model saved as ./AgglomerativeClustering_model.joblib")
+        
+        return model
+    
+    
+    def predict(self, model = None, test_set = None, metric = "euclidean"):
+        """
+        Model evaluation on unseen test set ( after fit() )
+        with fixed cluster center
+        
+        :param model: the AgglomerativeClustering model. Default to self.MODEL
+        :param test_set: test dataset for model evaluation. Default to self.TEST_SET
+        :param metric: str, distance metric for model
+        :return: tuple (cluster labels, silhouette score)
+        """
+        # default to class property if model and test_set are not provided
+        if not model:
+            model = self.MODEL
+        
+        if test_set is None:
+            test_set = self.TEST_SET
+        
+        test_labels = model["classifier"].predict(test_set)  # todo agglomerative evaluate test set
+        silhouette_score_ = silhouette_score(test_set, test_labels, metric = metric)
+        print(f"[INFO] Test Set Silhouette Score: {silhouette_score_:.4f}")
+        
+        return test_labels, silhouette_score_
+    
+    
+    def fit_predict(self, dataset = None, n_clusters = None, distance_threshold = 10.0, compute_full_tree = True, metric = "euclidean", linkage = "ward", save_model = True):
+        """
+        Train AgglomerativeClustering model
+
+        :param dataset: dataset for model training. Default to self.DATASET
+        :param n_clusters: int, number of clusters
+        :param distance_threshold: float, minimum distance between each cluster
+        :param compute_full_tree: bool
+        :param metric: str, distance metric for model
+        :param linkage: str, linkage method
+        :param save_model: bool, indicate whether to save the trained model or not
+        :return: tuple (AgglomerativeClustering model, number of clusters, cluster label for each data)
+        """
+        # default to class property if train_set are not provided
+        if not dataset:
+            dataset = self.DATASET
+        
+        # train the model
+        print(f"[INFO] Training AgglomerativeClustering model")
+        model = AgglomerativeClustering(
+                n_clusters = n_clusters,
+                distance_threshold = distance_threshold if not n_clusters else None,
+                compute_full_tree = compute_full_tree,
+                metric = metric,
+                linkage = linkage
+        )
+        cluster_label = model.fit_predict(dataset)
+        print("[INFO] Done")
+        
+        # save the model to class property
+        self.MODEL = model
+        print("[INFO] You may find the trained model in self.MODEL")
+        
+        # save the model to disk
+        if save_model:
+            joblib.dump(model, "AgglomerativeClustering_model.joblib")
+            print("[INFO] Model saved as ./AgglomerativeClustering_model.joblib")
+        
+        return model, model.n_clusters_, cluster_label
+    
+
+class TSKMeans(Clustering):
+    
+    def __init__(self):
+        """
+        A class for time series K-means clustering
+
+        Before working on the model,
+        user should call either dataset() or train_test_validation_set() or dataset_with_metadata()
+        to provide data for model training and evaluation using class methods
+        """
+        # Clustering.__init__(self)
+        super().__init__()
+    
+    
+    def find_optimal_k(self, k_range, train_set = None, validation_set = None, metric = "euclidean", random_state = 42):
+        """
+        Find optimal number of cluster k
+        (hyperparameter tuning)
+
+        :param k_range: tuple of int e.g. (3, 10), range of k to test
+        :param train_set: train dataset for model training. Default to self.TRAIN_SET
+        :param validation_set: validation set. Default to self.VALIDATION_SET
+        :param metric: str, distance metric for model e.g. euclidean, correlation, manhattan
+        :param random_state: int
+        :return: tuple (int: optimal k, float: silhouette score)
+        """
+        # default to class property if train_set and validation_set are not provided
+        if not train_set:
+            train_set = self.TRAIN_SET
+            # train_set = TimeSeriesScalerMeanVariance().fit_transform(train_set)
+        
+        if not validation_set:
+            validation_set = self.VALIDATION_SET
+            # validation_set = TimeSeriesScalerMeanVariance().fit_transform(validation_set)
+        
+        # find optimal number of cluster k
+        optimal_silhouette_k = 2
+        optimal_dbi_k = 2
+        silhouette_score_ = -1  # silhouette score find max, greatest separation between clusters
+        davies_bouldin_score_ = 1e3  # find min
+        inertia = []  # Elbow Method
+        
+        print("[INFO] Finding optimal value of k")
+        print(f"k  |  Silhouette Score  |  Davies Bouldin (DBI) Score  |  Inertia")
+        
+        for k in range(k_range[0], k_range[1] + 1):
+            np.random.seed(random_state)
+            _model = TimeSeriesKMeans(
+                    n_clusters = k,
+                    metric = metric,
+                    # method = "alternate",
+                    random_state = random_state,
+                    max_iter = 10
+            )
+            _model.fit(train_set)  # train model on train_set
+            _label = _model.predict(validation_set)  # predict data on validation_set
+            
+            # evaluate how well the validation data fit into trained clusters
+            _silhouette_score = silhouette_score(validation_set, _label, metric = metric)
+            _davies_bouldin_score = davies_bouldin_score(validation_set, _label)
+            print(f"{k} | {_silhouette_score} | {_davies_bouldin_score} | {_model.inertia_}")
+            
+            if _silhouette_score > silhouette_score_:
+                silhouette_score_ = _silhouette_score
+                optimal_silhouette_k = k
+            
+            if _davies_bouldin_score < davies_bouldin_score_:
+                davies_bouldin_score_ = _davies_bouldin_score
+                optimal_dbi_k = k
+            
+            # else:
+            #     print(f"Found optimal k = {optimal_k}")
+            #     break
+        
+        print(f"Optimal k for Silhouette Score : {optimal_silhouette_k}")
+        print(f"Optimal k for Davies Bouldin (DBI) Score : {optimal_dbi_k}")
+        
+        return optimal_silhouette_k, silhouette_score_  # todo
+    
+    
+    def fit(self, k, train_set = None, metric = "euclidean", random_state = 42, save_model = True):
+        """
+        Train K-Medoids model
+
+        :param k: int, number of clusters
+        :param train_set: train dataset for model training. Default to self.TRAIN_SET
+        :param metric: str, distance metric for model
+        :param random_state: int
+        :param save_model: bool, indicate whether to save the trained model or not
+        :return: the trained K-Medoids model
+        """
+        # default to class property if train_set are not provided
+        if not train_set:
+            # train_set = self.TRAIN_SET
+            train_set = np.vstack((self.TRAIN_SET, self.VALIDATION_SET))
+            # scale / normalize the data
+            # train_set = TimeSeriesScalerMeanVariance().fit_transform(train_set)
+        
+        # train the model
+        print(f"[INFO] Training Time Series K-Means model with k = {k} clusters")
+        model = TimeSeriesKMeans(
+                n_clusters = k,
+                metric = metric,
+                random_state = random_state
+        )
+        model.fit(train_set)
+        print("[INFO] Done")
+        
+        # save the model to class property
+        self.MODEL = model
+        print("[INFO] You may find the trained model in self.MODEL")
+        
+        # save the model to disk
+        if save_model:
+            joblib.dump(model, "K-Medoids_model.pkl")
+            print("[INFO] Model saved as ./K-Medoids_model.pkl")
+        
+        return model
+    
+    
+    def predict(self, model = None, test_set = None, metric = "euclidean"):
+        """
+        Model evaluation on unseen test set ( after fit() )
+        with fixed cluster center
+
+        :param model: the K-Medoids model. Default to self.MODEL
+        :param test_set: test dataset for model evaluation. Default to self.TEST_SET
+        :param metric: str, distance metric for model
+        :return: tuple (cluster labels, silhouette score)
+        """
+        # default to class property if model and test_set are not provided
+        if not model:
+            model = self.MODEL
+        
+        if test_set is None:
+            test_set = self.TEST_SET
+            # test_set = TimeSeriesScalerMeanVariance().fit_transform(test_set)
+        
+        test_labels = model.predict(test_set)
+        silhouette_score_ = silhouette_score(test_set, test_labels, metric = metric)
+        print(f"[INFO] Test Set Silhouette Score: {silhouette_score_:.4f}")
+        
+        return test_labels, silhouette_score_
+    
+
+class MiniBatchKMean(Clustering):
+    
+    def __init__(self):
+        """
+        A class for Mini Batch K-means clustering
+
+        Before working on the model,
+        user should call either dataset() or train_test_validation_set() or dataset_with_metadata()
+        to provide data for model training and evaluation using class methods
+        """
+        # Clustering.__init__(self)
+        super().__init__()
+        self.clusters = None
+    
+    
+    def find_optimal_k(self, k_range, train_set = None, validation_set = None, batch_size = 256, random_state = 42):
+        """
+        Find optimal number of cluster k
+        (hyperparameter tuning)
+
+        :param k_range: tuple of int e.g. (3, 10), range of k to test
+        :param train_set: train dataset for model training. Default to self.TRAIN_SET
+        :param validation_set: validation set. Default to self.VALIDATION_SET
+        :param batch_size: int
+        :param random_state: int
+        :return: tuple (int: optimal k, float: silhouette score)
+        """
+        # default to class property if train_set and validation_set are not provided
+        if not train_set:
+            train_set = self.TRAIN_SET
+        
+        if not validation_set:
+            validation_set = self.VALIDATION_SET
+        
+        # find optimal number of cluster k
+        optimal_silhouette_k = 2
+        optimal_dbi_k = 2
+        silhouette_score_ = -1  # silhouette score find max, greatest separation between clusters
+        inertia = []  # Elbow Method
+        davies_bouldin_score_ = 1e3  # find min
+        
+        print("[INFO] Finding optimal value of k")
+        print(f"k  |  Silhouette Score  |  Davies Bouldin (DBI) Score  |  Inertia")
+        
+        for k in range(k_range[0], k_range[1] + 1):
+            np.random.seed(random_state)
+            _model = MiniBatchKMeans(
+                    n_clusters = k,
+                    batch_size = batch_size,
+                    random_state = random_state,
+                    n_init = "auto"
+            )
+            _model.fit(train_set)  # train model on train_set
+            _label = _model.predict(validation_set)  # predict data on validation_set
+            
+            # evaluate how well the validation data fit into trained clusters
+            _silhouette_score = silhouette_score(validation_set, _label)
+            _davies_bouldin_score = davies_bouldin_score(validation_set, _label)
+            print(f"{k} | {_silhouette_score} | {_davies_bouldin_score} | {_model.inertia_}")
+            
+            if _silhouette_score > silhouette_score_:
+                silhouette_score_ = _silhouette_score
+                optimal_silhouette_k = k
+            
+            if _davies_bouldin_score < davies_bouldin_score_:
+                davies_bouldin_score_ = _davies_bouldin_score
+                optimal_dbi_k = k
+            
+            # else:
+            #     print(f"Found optimal k = {optimal_k}")
+            #     break
+        
+        print(f"Optimal k for Silhouette Score : {optimal_silhouette_k}")
+        print(f"Optimal k for Davies Bouldin (DBI) Score : {optimal_dbi_k}")
+        
+        return optimal_silhouette_k, silhouette_score_  # todo
+    
+    
+    def fit(self, k, train_set = None, batch_size = 256, random_state = 42, save_model = True):
+        """
+        Train Mini-batch K-Means model
+
+        :param k: int, number of clusters
+        :param train_set: train dataset for model training. Default to self.TRAIN_SET
+        :param batch_size: int
+        :param random_state: int
+        :param save_model: bool, indicate whether to save the trained model or not
+        :return: the trained Mini-batch K-Means model
+        """
+        # default to class property if train_set are not provided
+        if not train_set:
+            # train_set = self.TRAIN_SET
+            train_set = np.vstack((self.TRAIN_SET, self.VALIDATION_SET))
+        
+        # train the model
+        print(f"[INFO] Partial fitting Mini-batch K-Means model with k = {k} clusters")
+        model = MiniBatchKMeans(
+                n_clusters = k,
+                batch_size = batch_size,
+                random_state = random_state
+        )
+        model.partial_fit(train_set)
+        print("[INFO] Done")
+        
+        # save the model to class property
+        self.MODEL = model
+        print("[INFO] You may find the trained model in self.MODEL")
+        
+        # save the model to disk
+        if save_model:
+            joblib.dump(model, "Mini-batch_K-Means_model.pkl")
+            print("[INFO] Model saved as ./Mini-batch_K-Means_model.pkl")
+        
+        return model
+    
+    
+    def predict(self, model = None, test_set = None, batch_size = 256):
+        """
+        Model evaluation on unseen test set ( after fit() )
+        with fixed cluster center
+
+        :param model: the Mini-batch K-Means model. Default to self.MODEL
+        :param test_set: test dataset for model evaluation. Default to self.TEST_SET
+        :param metric: str, distance metric for model
+        :return: tuple (cluster labels, silhouette score)
+        """
+        # default to class property if model and test_set are not provided
+        if not model:
+            model = self.MODEL
+        
+        if test_set is None:
+            test_set = self.TEST_SET
+        
+        predicts = []
+        batch = []
+        
+        for data in test_set:
+            predicts.append(np.argmin(np.linalg.norm(self.clusters - data, axis = 1)))
+            batch.append(data)
+            
+            if len(batch) >= batch_size:
+                model.partial_fit(np.array(batch))
+                self.clusters = model.cluster_centers_
+                batch = []
+                
+        # test_labels = model.predict(test_set)
+        # silhouette_score_ = silhouette_score(test_set, test_labels)
+        # print(f"[INFO] Test Set Silhouette Score: {silhouette_score_:.4f}")
+        
+        # return test_labels, silhouette_score_
+        return predicts
+
+
+class PypotsCRLI(Clustering):
+    
+    def __init__(self):
+        """
+        A class for CRLI (from PyPots) clustering
+    
+        Before working on the model,
+        user should call either dataset() or train_test_validation_set() or dataset_with_metadata()
+        to provide data for model training and evaluation using class methods
+        """
+        # Clustering.__init__(self)
+        super().__init__()
+        self.n_samples = None  # self.DATASET.shape[0]  # number of data points (rows), assumed 2D dataset
+        self.n_steps = None  # self.DATASET.shape[1]  # number of data in each data points (columns)
+        self.n_features = 1
+        
+        self.n_clusters = None
+        
+        self.batch_size = 256
+        self.epoch = 30
+        self.n_generator_layers = 2
+        self.rnn_hidden_size = 128
+        self.rnn_cell_type = "LSTM"  # GRU / LSTM
+        self.device = "cpu"
+        
+        
+    def find_optimal_k(self, k_range, train_set = None, validation_set = None, **kwargs):
+        # default to class property if train_set and validation_set are not provided
+        if not train_set:
+            train_set = self.TRAIN_SET
+        
+        if not validation_set:
+            validation_set = self.VALIDATION_SET
+            
+        # find optimal number of cluster k
+        chs_score = 1e-3  # find max
+        dbs_score = 1e3  # find min
+        optimal_k_chs = 0
+        optimal_k_dbs = 0
+        optimal_k = 2
+        
+        print("[INFO] Finding optimal value of k")
+        print(f"k  |  Silhouette Score  |  Davies Bouldin (DBI) Score  |  Inertia")
+        
+        for k in range(10, 30):
+            print(f"Trying k = {k}")
+            model = CRLI(
+                    n_steps = self.n_steps,
+                    n_features = self.n_features,
+                    n_clusters = k,
+                    epochs = self.epoch,
+                    n_generator_layers = self.n_generator_layers,
+                    rnn_hidden_size = self.rnn_hidden_size,
+                    rnn_cell_type = self.rnn_cell_type,
+                    batch_size = self.batch_size,  # lower batch size to prevent memory overloading for large dataset
+                    # patience = 5,  # Early stopping patience
+                    device = self.device,
+                    **kwargs
+            )
+            model.fit(train_set = train_set)
+            predictions = model.predict(validation_set)
+            labels = predictions["clustering"]
+            imputed_features = predictions["imputed_X"].reshape(self.n_samples, -1)
+            _chs_score = calc_chs(imputed_features, labels)
+            _dbs_score = calc_dbs(imputed_features, labels)
+            
+            print(f"{k}  | ")
+            
+            if _chs_score > chs_score:
+                chs_score = _chs_score
+                optimal_k_chs = k
+            
+            if _dbs_score < dbs_score:
+                dbs_score = _dbs_score
+                optimal_k_dbs = k
+            
+            if k > max(optimal_k_chs, optimal_k_dbs):
+                optimal_k = k - 1
+                
+        self.n_clusters = optimal_k
+        print(f"[INFO] Optimal number of clusters {optimal_k} stored to class property")
+        
+        return optimal_k
+    
+    
+    def fit(self, train_set = None, save_model = True, **kwargs):
+        """
+        Train CRLI model
+        
+        :param train_set: train dataset for model training. Default to self.TRAIN_SET
+        :param save_model: bool, indicate whether to save the trained model or not
+        :return: the trained CRLI model
+        """
+        # default to class property if train_set are not provided
+        if not train_set:
+            # train_set = self.TRAIN_SET
+            train_set = np.vstack((self.TRAIN_SET, self.VALIDATION_SET))
+            
+        # train the model
+        print(f"[INFO] Training CRLI model with k = {self.n_clusters} clusters")
+        model = CRLI(
+                n_steps = self.n_steps,
+                n_features = self.n_features,
+                n_clusters = self.n_clusters,
+                epochs = self.epoch,
+                n_generator_layers = self.n_generator_layers,
+                rnn_hidden_size = self.rnn_hidden_size,
+                rnn_cell_type = self.rnn_cell_type,
+                batch_size = self.batch_size,  # lower batch size to prevent memory overloading for large dataset
+                # patience = 5,  # Early stopping patience
+                device = self.device,
+                **kwargs
+        )
+        model.fit(train_set)
+        print("[INFO] Done")
+        
+        # save the model to class property
+        self.MODEL = model
+        print("[INFO] You may find the trained model in self.MODEL")
+        
+        # save the model to disk
+        if save_model:
+            # joblib.dump(model, "CRLI_model.pypots")
+            model.save("CRLI_model.pypots")
+            print("[INFO] Model saved as ./CRLI_model.pypots")
+        
+        return model
+    
+    
+    def auto_partial_fit(self, dataset = None, save_model = True, **kwargs):
+        # default to class property if dataset are not provided
+        if not dataset.any():
+            dataset = self.DATASET
+            
+        temp_file_name = "temp_dataset.h5"
+        
+        if not os.path.exists(temp_file_name):
+            
+            with h5py.File(temp_file_name, "w") as file:
+                print(f"[INFO] Created temporary file {temp_file_name}")
+                X = file.create_dataset("X", shape = (self.n_samples, int(self.n_steps / 100), self.n_features), dtype = "float32")
+                print("[INFO] Writing data to file")
+                
+                for i in range(self.n_samples):
+                    _night_data = dataset[i]
+                    # _compressed_night_data = _night_data.reshape(int(self.n_steps / 100), 100).mean(axis = 1)
+                    _compressed_night_data = signal.resample(_night_data, int(self.n_steps / 100))
+                    X[i, :, 0] = _compressed_night_data
+                
+                file.close()
+        
+        model = self.fit(train_set = temp_file_name, save_model = save_model, **kwargs)
+        
+        return model
+    
+    
+    def predict(self):
+        pass
+    
     
 """
 NSB = NightSkyBrightness(
@@ -491,7 +1444,7 @@ def moon_phase_duffett(year, month, day):
 
 
 '''
-# TS3C
+# TS3C (trying)
 import numpy as np
 from sklearn.cluster import AgglomerativeClustering, KMeans
 from sklearn.metrics import silhouette_score, calinski_harabasz_score
@@ -690,42 +1643,82 @@ class TS3C_Hierarchical_Clustering:
 # 測試運行 (模擬 3 種不同環境的夜空光度觀測站)
 # =====================================================================
 if __name__ == "__main__":
-    np.random.seed(42)
-    # 模擬夜空光度數據 (不等長，數值代表 mag/arcsec²，數值愈大愈暗)
-    mock_nsb_data = [
-        # 站點 1 & 2：國際暗空公園 (高觀測品質，維持在 21.5 左右的高穩定暗度，受雲層影響微幅波動)
-        21.5 + np.sin(np.linspace(0, 3, 500)) * 0.2 + np.random.normal(0, 0.05, 500),
-        21.6 + np.sin(np.linspace(0, 3, 550)) * 0.15 + np.random.normal(0, 0.05, 550),
-        
-        # 站點 3 & 4：郊區觀測站 (中等光害，背景值在 19.5 左右，且因都市燈光反射，雲層一來光度會劇烈變亮/暴跌)
-        19.5 - np.abs(np.random.normal(0, 0.8, 480)),
-        19.3 - np.abs(np.random.normal(0, 0.7, 520)),
-        
-        # 站點 5 & 6：嚴重光害城市 (背景值極低約 17.0，且充滿人工光源的無規則隨機強光干擾)
-        17.0 + np.random.normal(0, 0.4, 510),
-        17.1 + np.random.normal(0, 0.35, 490)
-    ]
-    
-    db_HKU = DataBase("src/HKU.csv").read()
-    mock_nsb_data = []
+    dataset = []
     date = []
-    data_drop = 0
+    time = []
+    moon_illuminated_ratio = []
+    moon_phase = []
+    data_drop_count = 0
+    data_length_tolerance = 2 * 60 * 2  # min number of data points per night,  # 30s 1 data point, at least 2 hours of data
+    sun_set_time = "19:00:00"
+    sun_rise_time = "05:30:00"
+    
+    db_class = DataBase("src/HKU/HKU.csv")
+    db_HKU = db_class.read().drop_duplicates()
+    
+    # Pivot Data: Reshape into a nightly curve matrix
+    # [       time1 time2 ...
+    #   date1 nsb11 nsb12 ...
+    #   date2 nsb21 nsb22 ... ]
+    db_HKU_matrix = db_HKU.pivot(
+            index = "astronomical_date",
+            columns = "time",
+            values = "nsb"
+    )
+    # reorder matrix column "time" to match physical chronological order
+    _matrix_column = db_HKU_matrix.columns
+    _col_first = [i for i in _matrix_column if i >= "16:00:00"]
+    _col_first.sort()
+    _col_last = [i for i in _matrix_column if i <= "08:00:00"]
+    _col_last.sort()
+    
+    if len(_col_first) + len(_col_last) == len(_matrix_column):
+        db_HKU_matrix = db_HKU_matrix[_col_first + _col_last]
+    
+    else:
+        raise ValueError("[ERROR] in reordering matrix columns")
+    
+    # drop column according to fixed sun set/rise time
+    _filter = (
+            (db_HKU_matrix.columns >= sun_set_time) |
+            (db_HKU_matrix.columns <= sun_rise_time)
+    )
+    db_HKU_matrix = db_HKU_matrix.loc[:, _filter]
+    
+    # save the time
+    time = db_HKU_matrix.columns
+    
+    print("[INFO] Collecting data")
     
     for _date, _group in db_HKU.groupby("astronomical_date"):
-        _data = _group.iloc[:, 2].to_list()
+        _data = np.copy(db_HKU_matrix.loc[_date].values)  # numpy array
         
-        if len(_data) > 50 and not np.isnan(_data).any():
-            mock_nsb_data.append(
-                    _group.iloc[:, 2].to_list()
-            )
-            date.append(_date)
+        if len(_data[~np.isnan(_data)]) <= data_length_tolerance:
+            # drop night with insufficient data points
+            data_drop_count += 1
+            continue
         
-        else:
-            data_drop += 1
-            
-    print(f"Dropped {data_drop} nights of data")
+        # linear interpolate data
+        # https://stackoverflow.com/questions/38064697/interpolating-a-numpy-array-to-fit-another-array
+        # https://stackoverflow.com/questions/6518811/interpolate-nan-values-in-a-numpy-array
+        _data[np.isnan(_data)] = np.interp(
+                np.isnan(_data).nonzero()[0],
+                (~np.isnan(_data)).nonzero()[0],
+                _data[~np.isnan(_data)]
+        )
+        
+        # append to data structure
+        dataset.append(_data)
+        date.append(_date)
+        moon_illuminated_ratio.append(_group["moon_illuminated_ratio"])
+        moon_phase.append(_group["moon_phase"])
+    
+    print(f"[INFO] Dropped {data_drop_count} night(s) of data")
+    
+    
     
     # 執行全層次 TS3C 分群
+    mock_nsb_data = np.array(dataset)
     index = np.random.choice(len(mock_nsb_data), 365, replace = False)
     train_data = []
     for i in index:
@@ -754,5 +1747,5 @@ if __name__ == "__main__":
         cluster_data[i]["date"].append(date[i])
         print(
             f"📡 Day #{i + 1} (data length: {len(mock_nsb_data[i])}) -> 分類至: {label} (真實夜空特徵已保留)")
-    
 '''
+

@@ -1,19 +1,757 @@
 """
 Package Requirement :
+    matplotlib
     numpy == 1.26.4 (for scikit-learn-extra)
+    pandas == 2.3.3 (for numpy == 1.26.4)
     tslearn
     pypots
-    # sklearn
+    scikit-learn
     scikit-learn-extra
+    # scikit-fda
     # aeon
 """
 import datetime
 
+import numpy as np
+import pandas as pd
+# import skfda
+# from skfda.preprocessing.dim_reduction import FPCA  # multimethod < 2.1
+# from skfda.representation.basis import BSplineBasis
+# from sklearn.decomposition import IncrementalPCA, PCA
+from sklearn.preprocessing import StandardScaler
+from tslearn.preprocessing import TimeSeriesScalerMeanVariance
+
 from database import DataBase
 from figure import Figure
-from nsb import NightSkyBrightness
+from nsb import NightSkyBrightness, KMedoid, Agglomerative, TSKMeans, MiniBatchKMean, PypotsCRLI
 
 
+DATABASE_PATH = {  # path of dataset relative to main.
+    # raw database from online MySQL
+    "HKU_RAW": "iyl/sqmle_nsb_data_table/HKU.csv",
+    "TST_RAW": "iyl/sqmle_nsb_data_table/TST.csv",
+    "AP_RAW": "iyl/sqmle_nsb_data_table/AP.csv",
+    
+    # database for Sun/Moon rise/set time
+    "Sun_rise_set": "src/Sun/Sun_rise_set_2018-2026.csv",
+    "Moon_rise_set": "src/Moon/Moon_rise_set_2018-2026.csv",
+    
+    # dataset filtered for Sun set/rise
+    "HKU_sun_rise_set": "src/HKU/HKU_RAW.csv",
+    "TST_sun_rise_set": "src/TST/TST_RAW.csv",
+    
+    # dataset filtered for Sun set/rise
+    # with Moon phase and illuminated ratio injected
+    "HKU_sun_moon": "src/HKU/HKU.csv",
+    "TST_sun_moon": "src/TST/TST.csv",
+}
+MONTH = {
+    "01": "Jan",
+    "02": "Feb",
+    "03": "March",
+    "04": "April",
+    "05": "May",
+    "06": "June",
+    "07": "July",
+    "08": "Aug",
+    "09": "Sep",
+    "10": "Oct",
+    "11": "Nov",
+    "12": "Dec"
+}
+
+
+def custom_collect_data_sun_set_rise(
+        nsb_db_path,
+        sun_rise_set_db_path,
+        moon_rise_set_db_path,
+        export_file_name  # relative path with file name, no extension
+):
+    """
+    Extract data from 2018 to 2026
+    filter to get data only from sun set to sun rise
+    column "received_adjusted" is split into 2 columns "date" and "time"
+    only write column "date", "time", "nsb" to new file
+    
+    :param nsb_db_path:
+    :param sun_rise_set_db_path:
+    :param moon_rise_set_db_path:
+    :param export_file_name:
+    :return:
+    """
+    import pandas as pd
+    
+    NSB = NightSkyBrightness(
+            nsb_db_path,
+            sun_rise_set_db_path,
+            moon_rise_set_db_path
+    )
+    db_list = []  # yearly dataframe
+    
+    for year in range(2018, 2026 + 1):  # range of year to collect
+        _db_list = []  # 1-year data
+
+        for month in range(1, 12 + 1):
+            # get number of days in a month
+            month1 = datetime.date(year = year, month = month, day = 1)
+            month2 = datetime.date(year = year if month + 1 <= 12 else year + 1, month = (month + 1) % 12 if month + 1 > 12 else month + 1, day = 1)
+            days = month2 - month1
+            days = days.days
+
+            for day in range(1, days + 1):
+                # data from sun set to sun rise
+                df = NSB.get_one_night_data(f"{year}-{month:02}-{day:02}")[2]  # pandas.DataFrame
+
+                # convert str datetime to Python datetime
+                df["received_adjusted"] = pd.to_datetime(df["received_adjusted"])
+
+                # separate datetime into 2 columns: date, time
+                df["date"] = df["received_adjusted"].dt.date
+                df["time"] = df["received_adjusted"].dt.time
+
+                # append to data structure
+                _db_list.append(df[["date", "time", "nsb"]])  # internal
+
+                del df
+
+        # export the yearly dataframe (just in case)
+        _db = DataBase().concat(_db_list)
+        DataBase().export(f"{export_file_name}_{year}.csv", _db)
+        # append to data structure
+        db_list.append(_db)
+
+    # merge all gathered data into 1 dataframe
+    db = DataBase().concat(db_list)  # pandas.DataFrame
+    del db_list
+    
+    # export this dataframe for convenience future processing
+    DataBase().export(f"{export_file_name}.csv", dataframe = db)
+    
+    return db  # pandas.DataFrame
+
+
+def custom_db_insert_moon_data(
+        nsb_db_path,
+        sun_rise_set_db_path,
+        moon_rise_set_db_path,
+        export_file_name  # relative path with file name and extension
+):
+    """
+    After custom_collect_data_sun_set_rise()
+    insert astronomical_date --> group each night's date into single calendar date
+    insert moon phase and illuminated ratio
+    
+    :param nsb_db_path:
+    :param sun_rise_set_db_path:
+    :param moon_rise_set_db_path:
+    :param export_file_name:
+    :return:
+    """
+    import pandas as pd
+    
+    NSB = NightSkyBrightness(
+            nsb_db_path,
+            sun_rise_set_db_path,
+            moon_rise_set_db_path
+    )
+    db = NSB.nsb_db.read()  # DataBase(nsb_db_path).read()
+    
+    # convert date after midnight to previous date --> match the same astronomical night
+    _db_column_time = pd.to_datetime(db["date"] + " " + db["time"])  # convert whole column to datetime
+    _filters = (
+            (_db_column_time.dt.time >= pd.to_datetime("00:00").time()) &
+            (_db_column_time.dt.time <= pd.to_datetime("08:00").time())
+    )
+    db["astronomical_date"] = db["date"]  # copy from calendar date
+    # convert date after midnight to previous date in column "astronomical_date"
+    db.loc[_filters, "astronomical_date"] = (_db_column_time[_filters] - pd.Timedelta(days = 1)).dt.strftime("%Y-%m-%d")
+    
+    # tag moon phase to each night
+    db["moon_phase"] = db["astronomical_date"].apply(lambda x: NSB.get_moon_phase(x)[0])
+    db["moon_illuminated_ratio"] = db["astronomical_date"].apply(lambda x: NSB.get_moon_phase(x)[1])
+    
+    # export result
+    DataBase().export(export_file_name, dataframe = db)
+    
+    return db
+
+
+def custom_preprocess_data(nsb_db_path, interpolate = True):
+    """
+    After custom_db_insert_moon_data()
+    Filter data from fixed sun set time to sun rise time
+    Align data to a fixed timeline (time interval = 1s), missing data are filled with NaN
+    Drop data with number of data points less than data_length_tolerance per night
+    Drop night with unrealistic value of night sky brightness, outside range of (10, 23) mag arcsec-2
+    (optional) Interpolate NaN data without stretching / compressing
+    Store data and features into an array
+    
+    :param nsb_db_path: str
+    :param interpolate: bool
+    :return: tuple (dataset, date, time, moon_illuminated_ratio, moon_phase)
+    """
+    dataset = []
+    date = []
+    time = []
+    moon_illuminated_ratio = []
+    moon_phase = []
+    data_drop_count = 0
+    data_length_tolerance = 3 * 60*2  # minimum number of data points per night,  # 30s 1 data point, at least 3 hours of data
+    sun_set_time = "19:00:00"
+    sun_rise_time = "05:30:00"
+    
+    db_class = DataBase(nsb_db_path)
+    db = db_class.read().drop_duplicates()
+    
+    # Pivot Data: Reshape into a nightly curve matrix
+    # [       time1 time2 ...
+    #   date1 nsb11 nsb12 ...
+    #   date2 nsb21 nsb22 ... ]
+    db_matrix = db.pivot(
+            index = "astronomical_date",
+            columns = "time",
+            values = "nsb"
+    )
+    # reorder matrix column "time" to match physical chronological order
+    _matrix_column = db_matrix.columns
+    _col_first = [i for i in _matrix_column if i >= "16:00:00"]
+    _col_first.sort()
+    _col_last = [i for i in _matrix_column if i <= "08:00:00"]
+    _col_last.sort()
+    
+    if len(_col_first) + len(_col_last) == len(_matrix_column):
+        db_matrix = db_matrix[_col_first + _col_last]
+    
+    else:
+        raise ValueError("[ERROR] in reordering matrix columns")
+    
+    # drop column according to fixed sun set/rise time
+    _filter = (
+        (db_matrix.columns >= sun_set_time) |
+        (db_matrix.columns <= sun_rise_time)
+    )
+    db_matrix = db_matrix.loc[:, _filter]
+    
+    # save the time
+    time = db_matrix.columns
+    
+    print("[INFO] Collecting data")
+    
+    for _date, _group in db.groupby("astronomical_date"):
+        _data = np.copy( db_matrix.loc[_date].values )  # numpy array
+        
+        if len(_data[~np.isnan(_data)]) <= data_length_tolerance:
+            # drop night with insufficient data points
+            data_drop_count += 1
+            continue
+        
+        if np.nanmin(_data) <= 10.0 or np.nanmax(_data) >= 23.0:
+            # drop night with unrealistic value of night sky brightness
+            # outside range of (10, 23) mag arcsec-2
+            data_drop_count += 1
+            continue
+        
+        # linear interpolate data
+        # https://stackoverflow.com/questions/38064697/interpolating-a-numpy-array-to-fit-another-array
+        # https://stackoverflow.com/questions/6518811/interpolate-nan-values-in-a-numpy-array
+        if interpolate:
+            _data[np.isnan(_data)] = np.interp(
+                    np.isnan(_data).nonzero()[0],
+                    (~np.isnan(_data)).nonzero()[0],
+                    _data[~np.isnan(_data)]
+            )
+        
+        # append to data structure
+        dataset.append(_data)
+        date.append(_date)
+        moon_illuminated_ratio.append(_group["moon_illuminated_ratio"][_group["moon_illuminated_ratio"].keys()[0]])
+        moon_phase.append(_group["moon_phase"][_group["moon_phase"].keys()[0]])
+    
+    del db_class
+    del db
+    del db_matrix
+    dataset = np.array(dataset, dtype = np.float32)
+    date = np.array(date)
+    moon_illuminated_ratio = np.array(moon_illuminated_ratio, dtype = np.float32)
+    moon_phase = np.array(moon_phase)
+    print(f"[INFO] Dropped {data_drop_count} night(s) of data")
+    print(f"[INFO] Size of dataset : {dataset.shape}")
+    
+    return dataset, date, time, moon_illuminated_ratio, moon_phase
+
+
+# custom_collect_data_sun_set_rise(
+#         DATABASE_PATH["TST_RAW"],
+#         DATABASE_PATH["Sun_rise_set"],
+#         DATABASE_PATH["Moon_rise_set"],
+#         "src/TST/TST"
+# )
+# custom_db_insert_moon_data(
+#         DATABASE_PATH["TST_sun_rise_set"],
+#         DATABASE_PATH["Sun_rise_set"],
+#         DATABASE_PATH["Moon_rise_set"],
+#         "src/TST/TST.csv"
+# )
+
+dataset, date, time, moon_illuminated_ratio, moon_phase = custom_preprocess_data(
+        DATABASE_PATH["HKU_sun_moon"],
+        interpolate = True
+)
+
+
+# CRLI @ Pypots (run out of computer memory)
+# import torch
+# print(torch.cuda.is_available())
+# Initialized PyPOTS Ecosystem configuration file C:\\Users\\PAUL\\.pypots\\config.ini successfully.
+
+# down sampling
+# take mean for each segment
+print("[INFO] Down sampling")
+chunks = np.array_split(dataset, 1000, axis = 1)  # each night's data is split into 1200 segments
+compressed_dataset = []
+
+for chunk in chunks:
+    compressed_dataset.append(
+            np.nanmean(chunk, axis = 1, keepdims = True)
+    )
+
+compressed_dataset = np.squeeze( np.concatenate(compressed_dataset, axis = 1) )
+# compressed_dataset = np.nan_to_num(compressed_dataset, nan = 0.0)  # fill NaN with 0.0
+
+# reshape into PyPOTS 3D array format: (n_samples, n_steps, n_features)
+# Convert to the final 3D NumPy array for CRLI
+X = np.expand_dims(dataset, axis = -1)  # compressed_dataset[:, :, np.newaxis]  # 3D array
+
+train_indices = np.random.choice(X.shape[0], size = 2000, replace = False)
+X_train = X[train_indices]
+train_dataset = {
+    "X": X_train
+}
+all_dataset = {
+    "X": X
+}
+
+# STEP 4
+print(f"[INFO] Shape of dataset : {dataset.shape}")
+n_samples = dataset.shape[0]  # number of nights
+n_steps = dataset.shape[1]    # number of data points per night
+n_features = 1  # night-sky brightness
+
+print("[INFO] Train CRLI model")
+crli = PypotsCRLI()
+crli.n_samples = n_samples
+crli.n_steps = n_steps
+crli.n_clusters = 12
+crli.batch_size = 128  # todo memory issue
+crli.rnn_hidden_size = 32
+crli.epoch = 10
+
+# optimal_k = crli.find_optimal_k((10, 30), train_set = train_dataset, validation_set = train_dataset)
+
+# train actual CRLI model
+# crli.auto_partial_fit(dataset = dataset, save_model = True)
+crli.fit(train_set = train_dataset, save_model = True)
+
+# result = crli.MODEL.predict("temp_dataset.h5")
+result = crli.MODEL.predict(all_dataset, batch_size = crli.batch_size)
+label = result["clustering"]  # cluster ID corresponding to db_HKU_pivot.index
+
+# STEP 5
+print("[INFO] Step 5 : Plot result")
+print(label)
+
+# plot result
+print("[INFO] Plotting result")
+fig = Figure("CRLI Clustering\nHKU, 2018-2026, 19:00-05:30\n$I_{avg} = average moon illuminated ratio", 4, 6)
+
+for cluster_id in range(crli.n_clusters):
+    cluster_data = dataset[label == cluster_id].tolist()
+    _moon_illuminated_ratio_data = moon_illuminated_ratio[label == cluster_id].tolist()
+    
+    index = np.random.choice(len(cluster_data), size = min(50, len(cluster_data)), replace = False)
+    print(f"Plotting cluster {cluster_id}")
+    
+    for i in index:
+        fig.plot(
+                np.linspace(0, 1, len(cluster_data[i])),
+                cluster_data[i],
+                axes_index = cluster_id,
+                color = "grey",
+                alpha = 0.1
+        )
+    
+    fig.set_axes_properties(
+            axes_index = cluster_id,
+            title = f"Cluster {cluster_id}\n" + "$I_{avg}$ = " + f"{sum(_moon_illuminated_ratio_data) / len(_moon_illuminated_ratio_data):.1%}",
+            xlabel = "time",
+            ylabel = "NSB",
+            ylim = [13, 19],
+            # xticks = [0, len(time) - 1],
+            # xticklabels = [],
+            invert_yaxis = True,
+            # legend = True
+    )
+
+fig.show()
+
+"""
+# Mini-batch K-Means
+k_medoids = MiniBatchKMean()  # class object
+
+print("[INFO] Splitting dataset for training")
+# dataset_scaled = TimeSeriesScalerMeanVariance().fit_transform(dataset)[:, :, 0].copy()
+
+k_medoids.dataset_with_metadata(
+        dataset,
+        {
+            "date"                  : date,
+            "moon_illuminated_ratio": moon_illuminated_ratio,
+            "moon_phase"            : moon_phase
+        },
+        0.7,
+        0.15
+)
+
+
+# find optimal k
+optimal_k, train_silhouette_score = k_medoids.find_optimal_k((10, 30), batch_size = 256)  # todo
+print(f"Train score : {train_silhouette_score}")
+
+# train actual model
+k_medoids.fit(optimal_k, batch_size = 256, save_model = False)
+
+# test on unseen data
+test_label, test_silhouette_score = k_medoids.predict()
+
+# apply model to entire dataset
+cluster_labels = k_medoids.MODEL.fit_predict(dataset)
+# cluster_labels, dataset_silhouette_score = k_medoids.predict(test_set = dataset)
+
+
+# plot result
+print("[INFO] Plotting result")
+fig = Figure("K-Medoids Clustering\nHKU, 2018-2026, 19:00-05:30", 3, 5)
+
+for cluster_id, center_data in enumerate(k_medoids.MODEL.cluster_centers_):
+    cluster_data = dataset[cluster_labels == cluster_id].tolist()
+    index = np.random.choice(len(cluster_data), size = min(50, len(cluster_data)), replace = False)
+    print(f"Plotting cluster {cluster_id}")
+    
+    for i in index:
+        fig.plot(
+                np.linspace(0, 1, len(cluster_data[i])),
+                cluster_data[i],
+                axes_index = cluster_id,
+                color = "grey",
+                alpha = 0.1
+        )
+    
+    fig.plot(
+            np.linspace(0, 1, len(center_data)),
+            center_data,
+            axes_index = cluster_id,
+            label = f"Center {cluster_id}",
+            color = "red"
+    )
+    
+    fig.set_axes_properties(
+            axes_index = cluster_id,
+            title = f"Cluster {cluster_id}",
+            xlabel = "time",
+            ylabel = "NSB",
+            ylim = [13, 19],
+            # xticks = [0, len(time) - 1],
+            # xticklabels = [],
+            invert_yaxis = True,
+            # legend = True
+    )
+
+fig.show()
+"""
+"""
+# Time Series K-Means
+ts_kmeans = TSKMeans()  # class object
+
+print("[INFO] Spllitting dataset for training")
+dataset = TimeSeriesScalerMeanVariance(mu = 0, std = 1).fit_transform(dataset).squeeze()
+
+ts_kmeans.dataset_with_metadata(
+        dataset,
+        {
+            "date": date,
+            "moon_illuminated_ratio": moon_illuminated_ratio,
+            "moon_phase": moon_phase
+        },
+        0.7,
+        0.15
+)
+
+# find optimal k
+metric = "euclidean"
+optimal_k, train_silhouette_score = ts_kmeans.find_optimal_k((10, 30), metric = metric)  # todo
+print(f"Train score : {train_silhouette_score}")
+
+# train actual model
+ts_kmeans.fit(optimal_k, metric = metric, save_model = False)
+
+# test on unseen data
+test_label, test_silhouette_score = ts_kmeans.predict(metric = metric)
+
+# apply model to entire dataset
+cluster_labels = ts_kmeans.MODEL.fit_predict(dataset)
+# cluster_labels, dataset_silhouette_score = ts_kmeans.predict(test_set = dataset)
+
+
+# plot result
+print("[INFO] Plotting result")
+fig = Figure("TimeSeries K-Means Clustering\nHKU, 2018-2026, 19:00-05:30", 3, 5)
+
+for cluster_id, cluster_center in enumerate(ts_kmeans.MODEL.cluster_centers_):
+    center_data = cluster_center
+    cluster_data = dataset[cluster_labels == cluster_id].tolist()
+    index = np.random.choice(len(cluster_data), size = min(50, len(cluster_data)), replace = False)
+    print(f"Plotting cluster {cluster_id}")
+    
+    for i in index:
+        fig.plot(
+                np.linspace(0, 1, len(cluster_data[i])),
+                cluster_data[i],
+                axes_index = cluster_id,
+                color = "grey",
+                alpha = 0.1
+        )
+    
+    fig.plot(
+            np.linspace(0, 1, len(center_data)),
+            center_data,
+            axes_index = cluster_id,
+            label = f"Center {cluster_id}",
+            color = "red"
+    )
+    
+    fig.set_axes_properties(
+            axes_index = cluster_id,
+            title = f"Cluster {cluster_id}",
+            xlabel = "time",
+            ylabel = "NSB",
+            ylim = [13, 19],
+            # xticks = [0, len(time) - 1],
+            # xticklabels = [],
+            invert_yaxis = True,
+            # legend = True
+    )
+
+fig.show()
+"""
+"""
+# Agglomerative Clustering
+agglomerative = Agglomerative()
+# dataset_scaled = TimeSeriesScalerMeanVariance().fit_transform(dataset)[:, :, 0]
+agglomerative.dataset_with_metadata(
+        dataset,
+        {
+            "date": date,
+            "moon_illuminated_ratio": moon_illuminated_ratio,
+            "moon_phase": moon_phase
+        },
+        0.7,
+        0.15
+)
+# model, n_clusters, cluster_labels = agglomerative.fit_predict(
+#         distance_threshold = 1000.0,
+#         save_model = False
+# )
+model, n_clusters, cluster_labels = agglomerative.fit_predict(
+        n_clusters = 28,
+        save_model = False,
+)
+print(f"[INFO] Final number of clusters: {n_clusters}")
+
+
+# plot result
+from collections import Counter
+print("[INFO] Plotting result")
+fig = Figure("Agglomerative Clustering\nHKU, 2018-2026, 19:00-05:30\n$I_{avg}$ = average moon illuminated ratio",
+             4, 7
+)
+
+for cluster_id in range(n_clusters):
+    cluster_data = dataset[cluster_labels == cluster_id].tolist()
+    _moon_illuminated_ratio_data = moon_illuminated_ratio[cluster_labels == cluster_id].tolist()
+    _month = date[cluster_labels == cluster_id].tolist()
+    _month = [i.split("-")[1] for i in _month]
+    _common_month = Counter(_month).most_common(2)
+    
+    index = np.random.choice(len(cluster_data), size = min(50, len(cluster_data)), replace = False)
+    print(f"Plotting cluster {cluster_id}")
+    
+    for i in index:
+        fig.plot(
+                np.linspace(0, 1, len(cluster_data[i])),
+                cluster_data[i],
+                axes_index = cluster_id,
+                color = "grey",
+                alpha = 0.1
+        )
+    
+    fig.set_axes_properties(
+            axes_index = cluster_id,
+            title = f"Cluster {cluster_id} " +
+                    "($I_{avg}$ = " + f"{sum(_moon_illuminated_ratio_data) / len(_moon_illuminated_ratio_data):.1%})\n" +
+                    f"{MONTH[ _common_month[0][0] ]}: {_common_month[0][1] / len(_month):.1%}; {MONTH[ _common_month[1 if len(_common_month) > 1 else 0][0] ]}: {_common_month[1 if len(_common_month) > 1 else 0][1] / len(_month):.1%}",
+            xlabel = "time",
+            ylabel = "NSB",
+            ylim = [13, 19],
+            # xticks = [0, len(time) - 1],
+            # xticklabels = [],
+            invert_yaxis = True,
+            # legend = True
+    )
+
+fig.show()
+"""
+'''
+# K-Medoids clustering (updated)
+k_medoids = KMedoid()  # class object
+
+print("[INFO] Spllitting dataset for training")
+k_medoids.dataset_with_metadata(
+        dataset,
+        {
+            "date": date,
+            "moon_illuminated_ratio": moon_illuminated_ratio,
+            "moon_phase": moon_phase
+        },
+        0.7,
+        0.15
+)
+
+"""
+# apply FPCA
+print("[INFO] Applying FPCA")
+domain_range = (0, len(time))
+
+fd_train = skfda.FDataGrid(data_matrix = k_medoids.TRAIN_SET, grid_points = np.arange(len(time)), domain_range = domain_range)
+fd_validation = skfda.FDataGrid(data_matrix = k_medoids.VALIDATION_SET, grid_points = np.arange(len(time)), domain_range = domain_range)
+fd_test = skfda.FDataGrid(data_matrix = k_medoids.TEST_SET, grid_points = np.arange(len(time)), domain_range = domain_range)
+
+# use n_basis number of smooth curve to represent each night's data
+n_basis = 17  # 17, 7
+basis = BSplineBasis(domain_range = domain_range, n_basis = n_basis)
+
+fd_train_basis = fd_train.to_basis(basis)
+fd_validation_basis = fd_validation.to_basis(basis)
+fd_test_basis = fd_test.to_basis(basis)
+
+# take n_components number of major components (eigenfunction)
+n_components = 3  # 3, 4
+fpca = FPCA(n_components = n_components)
+fpca.fit(fd_train_basis)  # numpy.core._exceptions._ArrayMemoryError
+
+fpca_train = fpca.transform(fd_train_basis)
+fpca_validation = fpca.transform(fd_validation_basis)
+fpca_test = fpca.transform(fd_test_basis)
+
+k_medoids.TRAIN_SET = fpca_train
+k_medoids.VALIDATION_SET = fpca_validation
+k_medoids.TEST_SET = fpca_test
+"""
+"""
+# Apply Incremental PCA
+print("[INFO] Applying Incremental PCA")
+ipca = IncrementalPCA(n_components = 4)  # HKU:4, TST:2/7
+
+batch_size = 100
+for i in range(0, k_medoids.TRAIN_SET.shape[0], batch_size):
+    batch_x = k_medoids.TRAIN_SET[i:i+batch_size, :]
+    ipca.partial_fit(batch_x)
+
+ipca_train = ipca.transform(k_medoids.TRAIN_SET)
+ipca_validation = ipca.transform(k_medoids.VALIDATION_SET)
+ipca_test = ipca.transform(k_medoids.TEST_SET)
+
+k_medoids.TRAIN_SET = ipca_train
+k_medoids.VALIDATION_SET = ipca_validation
+k_medoids.TEST_SET = ipca_test
+"""
+"""
+# Apply PCA
+print("[INFO] Applying PCA")
+scaler = StandardScaler()
+scaled_train = scaler.fit_transform(k_medoids.TRAIN_SET)
+scaled_validation = scaler.fit_transform(k_medoids.VALIDATION_SET)
+scaled_test = scaler.fit_transform(k_medoids.TEST_SET)
+
+n_components = 5  # extract number of component to see variance distribution
+pca = PCA(n_components = n_components, random_state = 42)
+
+pca_train = pca.fit_transform(scaled_train)
+pca_validation = pca.fit_transform(scaled_validation)
+pca_test = pca.fit_transform(scaled_test)
+
+k_medoids.TRAIN_SET = pca_train
+k_medoids.VALIDATION_SET = pca_validation
+k_medoids.TEST_SET = pca_test
+"""
+
+# find optimal k
+metric = "euclidean"
+optimal_k, train_silhouette_score = k_medoids.find_optimal_k((10, 30), metric = metric)  # todo
+print(f"Train score : {train_silhouette_score}")
+
+# train actual model
+k_medoids.fit(optimal_k, metric = metric, save_model = False)
+
+# test on unseen data
+test_label, test_silhouette_score = k_medoids.predict(metric = metric)
+
+# apply model to entire dataset
+cluster_labels = k_medoids.MODEL.fit_predict(dataset, metric = metric)
+# cluster_labels, dataset_silhouette_score = k_medoids.predict(test_set = dataset)
+
+
+# plot result
+print("[INFO] Plotting result")
+fig = Figure("K-Medoids Clustering\nHKU, 2018-2026, 19:00-05:30", 3, 5)
+
+for cluster_id, medoid_index in enumerate(k_medoids.MODEL.medoid_indices_):
+    medoid_date = date[medoid_index]
+    medoid_data = dataset[medoid_index]
+    cluster_data = dataset[cluster_labels == cluster_id].tolist()
+    index = np.random.choice(len(cluster_data), size = min(50, len(cluster_data)), replace = False)
+    print(f"Plotting cluster {cluster_id}")
+    
+    for i in index:
+        fig.plot(
+                np.linspace(0, 1, len(cluster_data[i])),
+                cluster_data[i],
+                axes_index = cluster_id,
+                color = "grey",
+                alpha = 0.1
+        )
+    
+    fig.plot(
+            np.linspace(0, 1, len(medoid_data)),
+            medoid_data,
+            axes_index = cluster_id,
+            label = f"Medoid {cluster_id}",
+            color = "red"
+    )
+    
+    fig.set_axes_properties(
+            axes_index = cluster_id,
+            title = f"Cluster {cluster_id}",
+            xlabel = "time",
+            ylabel = "NSB",
+            ylim = [13, 19],
+            # xticks = [0, len(time) - 1],
+            # xticklabels = [],
+            invert_yaxis = True,
+            # legend = True
+    )
+
+fig.show()
+'''
 
 
 """
@@ -1056,11 +1794,11 @@ for k in range(3, 30):
     if _chs_score > chs_score:
         chs_score = _chs_score
         optimal_k_chs = k
-        
+
     if _dbs_score < dbs_score:
         dbs_score = _dbs_score
         optimal_k_dbs = k
-        
+
     if k > max(optimal_k_chs, optimal_k_dbs):
         optimal_k = k - 1
 

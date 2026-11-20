@@ -21,6 +21,7 @@ class DataBase:
         :param local_db: str, file name of local database (with extension), assumed csv
         """
         self.LOCAL_DB = local_db
+        print(f"[INFO] Using database {local_db}")
         # self.DATA_FRAME = None  # self.read()
 
 

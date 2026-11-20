@@ -30,7 +30,7 @@ import h5py
 import datetime
 import numpy as np
 from scipy import signal
-from sklearn.cluster import AgglomerativeClustering, MiniBatchKMeans
+from sklearn.cluster import AgglomerativeClustering, MiniBatchKMeans, KMeans
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.metrics import silhouette_score, davies_bouldin_score
 from sklearn.model_selection import train_test_split
@@ -826,14 +826,14 @@ class Agglomerative(Clustering):
     def fit_predict(self, dataset = None, n_clusters = None, distance_threshold = 10.0, compute_full_tree = True, metric = "euclidean", linkage = "ward", save_model = True):
         """
         Train AgglomerativeClustering model
-
+        
         :param dataset: dataset for model training. Default to self.DATASET
         :param n_clusters: int, number of clusters
         :param distance_threshold: float, minimum distance between each cluster
         :param compute_full_tree: bool
         :param metric: str, distance metric for model
         :param linkage: str, linkage method
-        :param save_model: bool, indicate whether to save the trained model or not
+        :param save_model: bool, indicate whether to save the trained model or not. Default is True if no model found in class property else False
         :return: tuple (AgglomerativeClustering model, number of clusters, cluster label for each data)
         """
         # default to class property if train_set are not provided
@@ -841,15 +841,139 @@ class Agglomerative(Clustering):
             dataset = self.DATASET
         
         # train the model
-        print(f"[INFO] Training AgglomerativeClustering model")
-        model = AgglomerativeClustering(
-                n_clusters = n_clusters,
-                distance_threshold = distance_threshold if not n_clusters else None,
-                compute_full_tree = compute_full_tree,
-                metric = metric,
-                linkage = linkage
-        )
+        if not self.MODEL:
+            print(f"[INFO] Training new AgglomerativeClustering model")
+            model = AgglomerativeClustering(
+                    n_clusters = n_clusters,
+                    distance_threshold = distance_threshold if not n_clusters else None,
+                    compute_full_tree = compute_full_tree,
+                    metric = metric,
+                    linkage = linkage
+            )
+            
+            # save the model to class property
+            self.MODEL = model
+            print("[INFO] You may find the trained model in self.MODEL")
+            
+        else:
+            print("[INFO] Using AgglomerativeClustering model from class property")
+            model = self.MODEL
+            save_model = False
+        
+        print("[INFO] fit_predict() . . .")
         cluster_label = model.fit_predict(dataset)
+        print("[INFO] Done")
+        
+        # save the model to disk
+        if save_model:
+            joblib.dump(model, "AgglomerativeClustering_model.joblib")
+            print("[INFO] Model saved as ./AgglomerativeClustering_model.joblib")
+        
+        return model, model.n_clusters_, cluster_label
+
+
+class KMean(Clustering):
+    
+    def __init__(self):
+        """
+        A class for K-means clustering
+
+        Before working on the model,
+        user should call either dataset() or train_test_validation_set() or dataset_with_metadata()
+        to provide data for model training and evaluation using class methods
+        """
+        # Clustering.__init__(self)
+        super().__init__()
+    
+    
+    def find_optimal_k(self, k_range, train_set = None, validation_set = None, random_state = 42):
+        """
+        Find optimal number of cluster k
+        (hyperparameter tuning)
+
+        :param k_range: tuple of int e.g. (3, 10), range of k to test
+        :param train_set: train dataset for model training. Default to self.TRAIN_SET
+        :param validation_set: validation set. Default to self.VALIDATION_SET
+        :param random_state: int
+        :return: tuple (int: optimal k, float: silhouette score)
+        """
+        # default to class property if train_set and validation_set are not provided
+        if not train_set:
+            train_set = self.TRAIN_SET
+            # train_set = TimeSeriesScalerMeanVariance().fit_transform(train_set)
+        
+        if not validation_set:
+            validation_set = self.VALIDATION_SET
+            # validation_set = TimeSeriesScalerMeanVariance().fit_transform(validation_set)
+        
+        # find optimal number of cluster k
+        optimal_silhouette_k = 2
+        optimal_dbi_k = 2
+        silhouette_score_ = -1  # silhouette score find max, greatest separation between clusters
+        davies_bouldin_score_ = 1e3  # find min
+        inertia = []  # Elbow Method
+        
+        print("[INFO] Finding optimal value of k")
+        print(f"k  |  Silhouette Score  |  Davies Bouldin (DBI) Score  |  Inertia")
+        
+        for k in range(k_range[0], k_range[1] + 1):
+            np.random.seed(random_state)
+            _model = KMeans(
+                    n_clusters = k,
+                    # method = "alternate",
+                    random_state = random_state,
+                    max_iter = 10
+            )
+            _model.fit(train_set)  # train model on train_set
+            _label = _model.predict(validation_set)  # predict data on validation_set
+            
+            # evaluate how well the validation data fit into trained clusters
+            _silhouette_score = silhouette_score(validation_set, _label, metric = "euclidean")
+            _davies_bouldin_score = davies_bouldin_score(validation_set, _label)
+            print(f"{k} | {_silhouette_score} | {_davies_bouldin_score} | {_model.inertia_}")
+            
+            if _silhouette_score > silhouette_score_:
+                silhouette_score_ = _silhouette_score
+                optimal_silhouette_k = k
+            
+            if _davies_bouldin_score < davies_bouldin_score_:
+                davies_bouldin_score_ = _davies_bouldin_score
+                optimal_dbi_k = k
+            
+            # else:
+            #     print(f"Found optimal k = {optimal_k}")
+            #     break
+        
+        print(f"Optimal k for Silhouette Score : {optimal_silhouette_k}")
+        print(f"Optimal k for Davies Bouldin (DBI) Score : {optimal_dbi_k}")
+        
+        return optimal_silhouette_k, silhouette_score_  # todo
+    
+    
+    def fit(self, k, train_set = None, random_state = 42, save_model = True):
+        """
+        Train K-Means model
+
+        :param k: int, number of clusters
+        :param train_set: train dataset for model training. Default to self.TRAIN_SET
+        :param random_state: int
+        :param save_model: bool, indicate whether to save the trained model or not
+        :return: the trained K-Means model
+        """
+        # default to class property if train_set are not provided
+        if not train_set:
+            # train_set = self.TRAIN_SET
+            train_set = np.vstack((self.TRAIN_SET, self.VALIDATION_SET))
+            # scale / normalize the data
+            # train_set = TimeSeriesScalerMeanVariance().fit_transform(train_set)
+        
+        # train the model
+        print(f"[INFO] Training Time Series K-Means model with k = {k} clusters")
+        model = KMeans(
+                n_clusters = k,
+                random_state = random_state
+        )
+        model.fit(train_set)
         print("[INFO] Done")
         
         # save the model to class property
@@ -858,17 +982,41 @@ class Agglomerative(Clustering):
         
         # save the model to disk
         if save_model:
-            joblib.dump(model, "AgglomerativeClustering_model.joblib")
-            print("[INFO] Model saved as ./AgglomerativeClustering_model.joblib")
+            joblib.dump(model, "K-Means_model.pkl")
+            print("[INFO] Model saved as ./K-Means_model.pkl")
         
-        return model, model.n_clusters_, cluster_label
+        return model
     
+    
+    def predict(self, model = None, test_set = None):
+        """
+        Model evaluation on unseen test set ( after fit() )
+        with fixed cluster center
+
+        :param model: the K-Medoids model. Default to self.MODEL
+        :param test_set: test dataset for model evaluation. Default to self.TEST_SET
+        :return: tuple (cluster labels, silhouette score)
+        """
+        # default to class property if model and test_set are not provided
+        if not model:
+            model = self.MODEL
+        
+        if test_set is None:
+            test_set = self.TEST_SET
+            # test_set = TimeSeriesScalerMeanVariance().fit_transform(test_set)
+        
+        test_labels = model.predict(test_set)
+        silhouette_score_ = silhouette_score(test_set, test_labels, metric = "euclidean")
+        print(f"[INFO] Test Set Silhouette Score: {silhouette_score_:.4f}")
+        
+        return test_labels, silhouette_score_
+
 
 class TSKMeans(Clustering):
     
     def __init__(self):
         """
-        A class for time series K-means clustering
+        A class for time series K-Means clustering
 
         Before working on the model,
         user should call either dataset() or train_test_validation_set() or dataset_with_metadata()
@@ -946,14 +1094,14 @@ class TSKMeans(Clustering):
     
     def fit(self, k, train_set = None, metric = "euclidean", random_state = 42, save_model = True):
         """
-        Train K-Medoids model
+        Train Time Series K-Means model
 
         :param k: int, number of clusters
         :param train_set: train dataset for model training. Default to self.TRAIN_SET
         :param metric: str, distance metric for model
         :param random_state: int
         :param save_model: bool, indicate whether to save the trained model or not
-        :return: the trained K-Medoids model
+        :return: the trained Time Series K-Means model
         """
         # default to class property if train_set are not provided
         if not train_set:
@@ -1748,4 +1896,3 @@ if __name__ == "__main__":
         print(
             f"📡 Day #{i + 1} (data length: {len(mock_nsb_data[i])}) -> 分類至: {label} (真實夜空特徵已保留)")
 '''
-
